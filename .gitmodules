@@ -1,0 +1,3 @@
+[submodule "fluorine"]
+	path = fluorine
+	url = git@github.com:fohristiwhirl/fluorine.git
