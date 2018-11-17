@@ -3,8 +3,9 @@ use hlt::position::Position;
 use hlt::ship::Ship;
 use hlt::ShipId;
 use hlt::game::Game;
-use std::collections::HashMap;
 use hlt::log::Log;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub struct Navi {
     pub width: usize,
@@ -107,65 +108,82 @@ impl Navi {
         self.moving.insert(ship.id, (ship_position, directions));
     }
 
-    pub fn move_ship(&mut self, ship_id: ShipId, moves: &mut Vec<(ShipId, Direction)>) {
-        let blue = "#0000FF";
-        let green = "#00FF00";
+    pub fn move_ship(&mut self, ship_id: ShipId, old: Position, new: Position) {
+        self.mark_safe(&old);
+        self.mark_unsafe(&new, ship_id);
+    }
 
+    pub fn swap_ships(
+        &mut self,
+        (pos1, ship1): (Position, ShipId),
+        (pos2, ship2): (Position, ShipId),
+    ) {
+        self.mark_unsafe(&pos1, ship2);
+        self.mark_unsafe(&pos2, ship1);
+    }
+
+    pub fn signal_move(
+        &mut self,
+        ship_id: ShipId,
+        moves: &mut Vec<(ShipId, Direction)>,
+        signals: &mut HashMap<Position, HashSet<ShipId>>,
+    ) {
+        let yellow = "#e2f442";
+
+        // If we want to move
         if let Some((position, directions)) = self.moving.remove(&ship_id) {
+            // For each potential movement direction
             for dir in directions {
-                Log::log(position, format!("-> {}", dir.get_char_encoding()), green);
-                
                 let new_pos = self.normalize(&position.directional_offset(dir));
 
-                if let Some(ship_at_dest) = self.occupied[new_pos.y as usize][new_pos.x as usize] {
-                    // Some bullship to subvert the borrow checker smh... cant wait for NLL
-                    let other_ship_moving = if self.moving.contains_key(&ship_at_dest) {
-                        Some(self.moving[&ship_at_dest].clone())
-                    } else {
-                        None
-                    };
+                // Ship at target position
+                if let Some(unsafe_ship) = self.get(&new_pos) {
+                    // Ship wants to swap if they signal for my position
+                    if signals.get_mut(&position).map(|ships| ships.remove(&unsafe_ship)).unwrap_or_default() {
+                        self.swap_ships((position, ship_id), (new_pos, unsafe_ship));
+                        moves.push((ship_id, dir));
+                        moves.push((unsafe_ship, dir.invert_direction()));
+                        return
+                    }
 
-                    if let Some((_, other_dirs)) = other_ship_moving {
-                        for odir in other_dirs {
-                            let opos = self.normalize(&new_pos.directional_offset(odir.clone()));
+                    // Ship doesn't want to swap, so signal them to move or swap
+                    signals.entry(new_pos) 
+                        .and_modify(|ships| {
+                            ships.insert(ship_id); 
+                        }).or_insert_with(|| {
+                            let mut ships = HashSet::new();
+                            ships.insert(ship_id);
+                            ships
+                        });
+                    self.signal_move(unsafe_ship, moves, signals);
 
-                            // Ship at target wants to move to our position
-                            if opos == position {
-                                Log::log(position, "swap", blue);
-                                Log::log(new_pos, "swap", blue);
-
-                                moves.push((ship_id, dir));
-                                moves.push((ship_at_dest, odir.clone()));
-                                return
-                            }
-                        }
-
-                        self.move_ship(ship_id, moves);
-                    } else {
-                        continue
+                    // If we swapped, return
+                    if self.get(&new_pos) == Some(ship_id) {
+                        return
                     }
                 }
 
+                // Its safe to move, so move
                 if self.is_safe(&new_pos) {
-                    self.mark_unsafe(&new_pos, ship_id);
-                    self.mark_safe(&position);
+                    self.move_ship(ship_id, position, new_pos);
                     moves.push((ship_id, dir));
                     return
                 }
             }
 
             // No possible move :(
-            Log::log(position, format!("{}:{} <still>", file!(), line!()), "#FF0000");
+            Log::log(position, "_nomov_", yellow);
             moves.push((ship_id, Direction::Still));
         }
     }
+
 
     pub fn collect_moves(&mut self) -> Vec<(ShipId, Direction)> {
         let mut moves: Vec<(ShipId, Direction)> = Vec::new();
         let ships: Vec<ShipId> = self.moving.keys().cloned().collect();
 
         for ship_id in ships {
-            self.move_ship(ship_id, &mut moves);
+            self.signal_move(ship_id, &mut moves, &mut HashMap::new());
         }
 
         moves

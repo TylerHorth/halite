@@ -53,14 +53,14 @@ impl Constants {
         let s = Constants::get_string(map, key);
         match s.parse::<T>() {
             Ok(x) => x,
-            Err(_) => Log::panic(&format!("Error: constants: for {} got '{}' from server and failed to parse that.", key, s))
+            Err(_) => Log::panic(format!("Error: constants: for {} got '{}' from server and failed to parse that.", key, s))
         }
     }
 
     fn get_string<'a>(map: &'a HashMap<String, String>, key: &str) -> &'a String {
         match map.get(key) {
             Some(x) => x,
-            None => Log::panic(&format!("Error: constants: server did not send {} constant.", key))
+            None => Log::panic(format!("Error: constants: server did not send {} constant.", key))
         }
     }
 }

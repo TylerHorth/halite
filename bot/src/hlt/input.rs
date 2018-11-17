@@ -48,7 +48,7 @@ impl Input {
 
         let result = match token.parse() {
             Ok(x) => x,
-            Err(_) => Log::panic(&format!("Can't parse '{}'.", token)),
+            Err(_) => Log::panic(format!("Can't parse '{}'.", token)),
         };
         result
     }

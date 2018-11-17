@@ -10,14 +10,18 @@ use hlt::log::Log;
 use hlt::position::Position;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::hash_map::Entry;
 
 mod hlt;
 
 fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Position>) -> Option<Position> {
     map.iter()
-        .filter(|cell| cell.halite > target)
+        // Cell has target halite
+        .filter(|cell| cell.halite >= target)
+        // Cell isn't already targeted by another ship
         .filter(|cell| !taken.contains(&cell.position))
+        // Cell is not at current position (sanity)
+        .filter(|cell| cell.position != pos)
+        // Get closest
         .min_by_key(|cell| map.calculate_distance(&pos, &cell.position))
         .map(|cell| cell.position.clone())
 }
@@ -25,12 +29,23 @@ fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Posi
 fn main() {
     let mut game = Game::new();
     let mut navi = Navi::new(game.map.width, game.map.height);
-    // At this point "game" variable is populated with initial map data.
-    // This is a good place to do computationally expensive start-up pre-processing.
-    // As soon as you call "ready" function below, the 2 second per turn timer will start.
+
+    // Constants
+    let mut target_halite = game.constants.max_halite / 10;
+    let mut ship_full = 8 * target_halite;
+
+    // Colors
+    let red = "#FF0000";
+    let purple = "#9d00ff";
+    let orange = "#ff8800";
+    let green = "#00ff48";
+    let teal = "#42f4ee";
+    let pink = "#ff00dc";
+
     Game::ready("bugs");
 
     let mut targets: HashMap<ShipId, Position> = HashMap::new();
+    let mut terminal = false;
 
     loop {
         game.update_frame();
@@ -41,75 +56,127 @@ fn main() {
 
         let mut command_queue: Vec<Command> = Vec::new();
 
+        terminal = terminal || me.ship_ids
+            .iter()
+            .cloned()
+            .any(|ship_id| {
+                let ship = &game.ships[&ship_id];
+                let dist = map.calculate_distance(&ship.position, &me.shipyard.position);
+                let turns_remaining = game.constants.max_turns - game.turn_number;
+
+                dist + 15 > turns_remaining
+            });
+
+        if terminal {
+            Log::log(me.shipyard.position, "_terminal_", red);
+
+            // Move towards target
+            for ship_id in me.ship_ids.iter() {
+                let ship = &game.ships[ship_id];
+                let cell = map.at_entity(ship);
+
+                // If we have enough halite to move
+                if ship.halite >= cell.halite / 10 {
+                    let mut unsafe_moves = navi.get_unsafe_moves(&ship.position, &me.shipyard.position).into_iter();
+                    let command = loop {
+                        if let Some(dir) = unsafe_moves.next() {
+                            let target_pos = ship.position.directional_offset(dir);
+
+                            if navi.is_safe(&target_pos) || target_pos == me.shipyard.position {
+                                Log::log(ship.position, format!("_term_{}_", dir.get_char_encoding()), pink);
+                                navi.mark_unsafe(&target_pos, ship.id);
+                                break Some(ship.move_ship(dir));
+                            }
+                        } else {
+                            break None;
+                        }
+                    };
+
+                    if let Some(command) = command {
+                        command_queue.push(command);
+                    } else {
+                        Log::log(ship.position, "_frozen_", teal);
+                        command_queue.push(ship.stay_still());
+                    }
+                } else {
+                    Log::log(ship.position, "_fuel_", orange);
+                    command_queue.push(ship.stay_still());
+                }
+            }
+
+            game.end_turn(&command_queue);
+
+            continue
+        }
+
         // Remove ships which have reached their target
         targets.retain(|ship_id, &mut target| { 
-            if let Some(ship) = game.ships.get(&ship_id) {
-                ship.position != target
-            } else {
-                false
-            }
+            game.ships
+                .get(&ship_id)
+                .map(|ship| ship.position != target)
+                .unwrap_or_default()
         });
 
+        // Add targets for ships that don't have one
+        // If can't find target, stay still and log
         for ship_id in me.ship_ids.iter().cloned() {
             let ship = &game.ships[&ship_id];
             let cell = map.at_entity(ship);
-
             let taken: HashSet<Position> = targets.values().cloned().collect();
 
-            let can_move = ship.halite >= cell.halite / 10;
+            if !targets.contains_key(&ship_id) {
+                let target = if ship.halite >= ship_full {
+                    // If ship full, return to base
+                    Some(me.shipyard.position)
+                } else if cell.halite < target_halite {
+                    // If cell not worth mining, find new cell
+                    let mut target = find_target(ship.position, &map, target_halite, &taken);
+                    while target.is_none() {
+                        target_halite = target_halite / 2;
+                        ship_full = 8 * target_halite;
 
-            match targets.entry(ship_id) {
-                Entry::Occupied(target) => {
-                    // We have a target, and we haven't reached it yet
-                    if cell.halite < game.constants.max_halite / 10 || ship.halite as f32 > 0.9 * game.constants.max_halite as f32 {
-                        if can_move {
-                            navi.naive_navigate(&ship, target.get());
-                        } else {
-                            Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                            command_queue.push(ship.stay_still());
-                        }
-                    } else {
-                        Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                        command_queue.push(ship.stay_still());
+                        Log::log(ship.position, format!("_tar_{}", target_halite), red);
+
+                        target = find_target(ship.position, &map, target_halite, &taken);
                     }
+
+                    target
+                } else {
+                    // Ship not full, cell worth mining, should stay still
+                    Log::log(ship.position, "_mine_", purple);
+                    None
+                };
+
+                if let Some(target) = target {
+                    targets.insert(ship_id, target); 
+                } else {
+                    // No target. Either cell worth mining, or no target could be found
+                    command_queue.push(ship.stay_still());
                 }
-                Entry::Vacant(target) => 
-                    if ship.halite as f32 > 0.9 * game.constants.max_halite as f32 {
-                        let target_pos = me.shipyard.position;
-
-                        target.insert(target_pos);
-                        if can_move {
-                            navi.naive_navigate(&ship, &target_pos);
-                        } else {
-                            Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                            command_queue.push(ship.stay_still());
-                        }
-                    } else if cell.halite < game.constants.max_halite / 10 {
-                        let target_val = game.constants.max_halite / 10;
-
-                        if let Some(pos) = find_target(ship.position, &map, target_val, &taken) {
-                            if can_move {
-                                navi.naive_navigate(&ship, &pos);
-                            } else {
-                                Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                                command_queue.push(ship.stay_still());
-                            }
-                            target.insert(pos);
-                        } else {
-                            Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                            command_queue.push(ship.stay_still());
-                        }
-                    } else {
-                        Log::log(ship.position, format!("{}:{} still", file!(), line!()), "#FF0000");
-                        command_queue.push(ship.stay_still());
-                    }
-            };
-
-
-            for (ship_id, dir) in navi.collect_moves() {
-                Log::log(game.ships[&ship_id].position, format!("move {}", dir.get_char_encoding()), "#00FFFF");
-                command_queue.push(Command::move_ship(ship_id, dir));
             }
+        }
+
+        // Move towards target
+        for (ship_id, position) in targets.iter() {
+            // paint target
+            Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
+
+            let ship = &game.ships[ship_id];
+            let cell = map.at_entity(ship);
+
+            // If we have enough halite to move
+            if ship.halite >= cell.halite / 10 {
+                navi.naive_navigate(ship, position);
+            } else {
+                Log::log(ship.position, "_fuel_", orange);
+                command_queue.push(ship.stay_still());
+            }
+        }
+
+
+        for (ship_id, dir) in navi.collect_moves() {
+            Log::log(game.ships[&ship_id].position, format!("_{}_", dir.get_char_encoding()), green);
+            command_queue.push(Command::move_ship(ship_id, dir));
         }
 
         if game.turn_number <= 200 &&
@@ -119,6 +186,6 @@ fn main() {
             command_queue.push(me.shipyard.spawn());
         }
 
-        Game::end_turn(&command_queue);
+        game.end_turn(&command_queue);
     }
 }

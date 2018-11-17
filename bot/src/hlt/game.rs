@@ -63,8 +63,6 @@ impl Game {
         input.read_and_parse_line();
         self.turn_number = input.next_usize();
 
-        Log::turn(self.turn_number);
-
         self.ships.clear();
         self.dropoffs.clear();
 
@@ -98,7 +96,9 @@ impl Game {
         }
     }
 
-    pub fn end_turn(commands: &[Command]) {
+    pub fn end_turn(&self, commands: &[Command]) {
+        Log::turn(self.turn_number);
+
         for command in commands {
             print!("{} ", command.0);
         }

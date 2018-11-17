@@ -2,167 +2,143 @@ use std::fs::File;
 use std::io::Write;
 use std::process::exit;
 use std::sync::Mutex;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-use std::collections::HashMap;
 use hlt::position::Position;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt;
+use std::io::BufWriter;
 
 lazy_static! {
     static ref LOG: Mutex<Log> = Mutex::new(Log::new());
 }
 
+pub struct Message {
+    turn: usize,
+    pos: Position,
+    msg: Option<String>,
+    col: Option<String>
+}
+
+impl Display for Message {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{{ \"t\": {}, \"x\": {}, \"y\": {}", self.turn, self.pos.x, self.pos.y)?;
+
+        if let Some(ref message) = self.msg {
+            write!(f, ", \"msg\": \"{}\"", message);
+        }
+
+        if let Some(ref color) = self.col {
+            write!(f, ", \"color\": \"{}\"", color);
+        }
+
+        write!(f, " }},")
+    }
+}
+
 pub struct Log {
-    turn_num: usize,
-
-    messages: HashMap<Position, (Option<String>, Option<String>)>,
-
-    log_buffer: Option<Vec<String>>,
-    file: Option<File>,
+    turn: usize,
+    messages: Vec<Message>,
+    writer: Option<BufWriter<File>>
 }
 
 impl Log {
     pub fn new() -> Log {
-        let mut buffer = Vec::new();
-        buffer.push("[ ".into());
-        let ret = Log {turn_num: 0, messages: HashMap::new(), log_buffer: Some(buffer), file: None };
+        let ret = Log {
+            turn: 0,
+            messages: Vec::new(),
+            writer: None 
+        };
         ret
     }
 
     pub fn open(bot_id: usize) {
         let mut log = LOG.lock().unwrap();
 
-        if log.file.is_some() {
-            Log::panic_inner(&mut log, &format!("Error: log: tried to open({}) but we have already opened before.", bot_id));
+        if log.writer.is_some() {
+            drop(log);
+            Log::panic(format!("Error: log: tried to open({}) but we have already opened before.", bot_id));
         }
 
         let filename = format!("bot-{}.log", bot_id);
-        let mut file = File::create(&filename).expect(&format!("Couldn't open file {} for logging!", &filename));
+        let file = File::create(&filename).expect(&format!("Couldn't open file {} for logging!", &filename));
+        let mut writer = BufWriter::new(file);
 
-        Log::dump_log_buffer(&log.log_buffer, &mut file);
+        writeln!(writer, "[").unwrap();
 
-        log.file = Some(file);
-        log.log_buffer = None;
+        log.writer = Some(writer);
+
     }
 
     pub fn turn(turn_num: usize) {
         let mut log = LOG.lock().unwrap();
+        log.turn = turn_num;
 
-        if log.turn_num != turn_num {
-            log.turn_num = turn_num;
+        let messages: Vec<_> = log.messages.drain(..).collect();
 
-            let messages: Vec<_> = log.messages.drain().collect();
+        let writer = log.writer.as_mut().expect("Must open file before logging.");
 
-            for (pos, (message, color)) in messages {
-                let mut record = format!("{{ \"t\": {}, \"x\": {}, \"y\": {}", turn_num, pos.x, pos.y);
-
-                if let Some(message) = message {
-                    record.push_str(&format!(", \"msg\": \"{}\"", message));
-                }
-
-                if let Some(color) = color {
-                    record.push_str(&format!(", \"color\": \"{}\"", color));
-                }
-
-                record.push_str(" },\n");
-
-                match &mut log.file {
-                    Some(file) => {
-                        writeln!(file, "{}", record).unwrap();
-                        return;
-                    },
-                    None => ()
-                }
-
-                match &mut log.log_buffer {
-                    Some(log_buffer) => {
-                        log_buffer.push(record);
-                    },
-                    None => panic!("Error: both file and log_buffer as missing.")
-                }
-            }
+        for message in messages {
+            writeln!(writer, "{}", message).unwrap();
         }
 
+        writer.flush().unwrap();
     }
 
     pub fn log(pos: Position, message: impl Into<String>, color: impl Into<String>) {
         let mut log = LOG.lock().unwrap();
 
-        let message = message.into();
-        let color = color.into();
+        let turn = log.turn;
+        let msg = Some(message.into());
+        let col = Some(color.into());
 
-        log.messages.entry(pos)
-            .and_modify(|e| {
-                if e.0.is_some() {
-                    let m = e.0.take().unwrap();
-                    e.0 = Some(m + ":" + &message.clone());
-                } else {
-                    e.0 = Some(message.clone());
-                }
-
-                e.1 = Some(color.clone());
-            })
-            .or_insert((Some(message.clone()), Some(color.clone())));
+        log.messages.push(Message { turn, pos, msg, col });
     }
 
-    pub fn msg(pos: Position, message: &str) {
+    pub fn msg(pos: Position, message: impl Into<String>) {
         let mut log = LOG.lock().unwrap();
 
-        log.messages.entry(pos)
-            .and_modify(|e|  e.0 = e.clone().0.map_or(Some(message.into()), |m| Some(m + ":" + message)))
-            .or_insert((Some(message.into()), None));
+        let turn = log.turn;
+        let msg = Some(message.into());
+        let col = None;
+
+        log.messages.push(Message { turn, pos, msg, col });
     }
 
-    pub fn color(pos: Position, color: &str) {
+    pub fn color(pos: Position, color: impl Into<String>) {
         let mut log = LOG.lock().unwrap();
 
-        log.messages.entry(pos)
-            .and_modify(|e| e.1 = Some(color.into()))
-            .or_insert((None, Some(color.into())));
+        let turn = log.turn;
+        let msg = None;
+        let col = Some(color.into());
+
+        log.messages.push(Message { turn, pos, msg, col });
     }
 
     pub fn flush() {
-        let mut log = LOG.lock().unwrap();
+        let log = LOG.lock().unwrap();
+        let turn_num = log.turn;
+        drop(log);
 
-        match &mut log.file {
-            Some(file) => { file.flush().unwrap(); },
-            None => (),
-        }
+        Log::turn(turn_num);
     }
 
-    pub fn panic(message: &str) -> ! {
-        let mut log = LOG.lock().unwrap();
-        Log::panic_inner(&mut log, message)
+    pub fn flash(message: impl Into<String>, color: impl Into<String>) {
+        let log = LOG.lock().unwrap();
+        let turn_num = log.turn;
+        drop(log);
+
+        let zero_pos = Position { x: 0, y: 0 };
+        Log::log(zero_pos, message, color);
+        Log::turn(turn_num);
     }
 
-    fn panic_inner(log: &mut Log, message: &str) -> ! {
-        if log.file.is_none() {
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let filename = format!("bot-unknown-{}.log", timestamp.as_secs());
-            let file = File::create(&filename).expect(&format!("Couldn't open file {} for logging!", &filename));
-            log.file = Some(file);
-        }
-
-        let file = match &mut log.file {
-            Some(file) => file,
-            None => panic!("Error: file should exist!")
-        };
-
-        Log::dump_log_buffer(&log.log_buffer, file);
-
-        writeln!(file, "{}", message).unwrap();
-        file.flush().unwrap();
-
-        exit(1);
+    pub fn info(message: impl Into<String>) {
+        Log::flash(message, "#9bc6ff");
     }
 
-    fn dump_log_buffer(log_buffer: &Option<Vec<String>>, file: &mut File) {
-        match log_buffer {
-            Some(log_buffer) => {
-                for message in log_buffer {
-                    writeln!(file, "{}", message).unwrap();
-                }
-            }
-            None => ()
-        }
+    pub fn panic(message: impl Into<String>) -> ! {
+        Log::flash(message, "#FF0000");
+
+        exit(1)
     }
 }
