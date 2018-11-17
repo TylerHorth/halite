@@ -22,7 +22,12 @@ fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Posi
         // Cell is not at current position (sanity)
         .filter(|cell| cell.position != pos)
         // Get closest
-        .min_by_key(|cell| map.calculate_distance(&pos, &cell.position))
+        .max_by_key(|cell| {
+            let dist = map.calculate_distance(&pos, &cell.position) as f64;
+            let hal = cell.halite as f64;
+
+            (hal / (dist * dist)) as u64
+        })
         .map(|cell| cell.position.clone())
 }
 
@@ -128,7 +133,7 @@ fn main() {
                 let target = if ship.halite >= ship_full {
                     // If ship full, return to base
                     Some(me.shipyard.position)
-                } else if cell.halite < target_halite {
+                } else if cell.halite < target_halite / 2  {
                     // If cell not worth mining, find new cell
                     let mut target = find_target(ship.position, &map, target_halite, &taken);
                     while target.is_none() {
@@ -179,7 +184,7 @@ fn main() {
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
-        if game.turn_number <= 200 &&
+        if game.turn_number <= 150 &&
             me.halite >= game.constants.ship_cost &&
                 navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {

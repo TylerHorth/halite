@@ -141,6 +141,7 @@ impl Navi {
                     // Ship wants to swap if they signal for my position
                     if signals.get_mut(&position).map(|ships| ships.remove(&unsafe_ship)).unwrap_or_default() {
                         self.swap_ships((position, ship_id), (new_pos, unsafe_ship));
+                        Log::log(position, "_swap1_", yellow);
                         moves.push((ship_id, dir));
                         moves.push((unsafe_ship, dir.invert_direction()));
                         return
@@ -159,6 +160,7 @@ impl Navi {
 
                     // If we swapped, return
                     if self.get(&new_pos) == Some(ship_id) {
+                        Log::log(position, "_swap2_", yellow);
                         return
                     }
                 }
