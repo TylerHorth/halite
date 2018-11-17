@@ -184,7 +184,7 @@ fn main() {
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
-        if game.turn_number <= 150 &&
+        if game.turn_number <= game.constants.max_turns / 2 &&
             me.halite >= game.constants.ship_cost &&
                 navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {
