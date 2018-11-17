@@ -37,7 +37,7 @@ fn main() {
 
     // Constants
     let mut target_halite = game.constants.max_halite / 10;
-    let mut ship_full = 8 * target_halite;
+    let mut ship_full = 9 * target_halite;
 
     // Colors
     let red = "#FF0000";
