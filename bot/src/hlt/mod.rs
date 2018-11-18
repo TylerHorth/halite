@@ -28,6 +28,8 @@ pub mod position;
 pub mod ship;
 #[allow(dead_code)]
 pub mod shipyard;
+#[allow(dead_code)]
+pub mod colors;
 
 #[allow(dead_code)]
 mod input;

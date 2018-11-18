@@ -1,201 +1,201 @@
+use bimap::BiMap;
+use hlt::colors::*;
 use hlt::direction::Direction;
+use hlt::dropoff::Dropoff;
+use hlt::game::Game;
+use hlt::game_map::GameMap;
+use hlt::log::Log;
 use hlt::position::Position;
 use hlt::ship::Ship;
 use hlt::ShipId;
-use hlt::game::Game;
-use hlt::log::Log;
+use hlt::constants::Constants;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::iter::FromIterator;
 
-pub struct Navi {
-    pub width: usize,
-    pub height: usize,
-    pub moving: HashMap<ShipId, (Position, Vec<Direction>)>,
-    pub occupied: Vec<Vec<Option<ShipId>>>,
+enum Command {
+    Harvest(ShipId, usize),
+    Move(ShipId, Position, Position, usize),
 }
 
-impl Navi {
-    pub fn new(width: usize, height: usize) -> Navi {
-        let mut occupied: Vec<Vec<Option<ShipId>>> = Vec::with_capacity(height);
-        for _ in 0..height {
-            occupied.push(vec![None; width]);
-        }
+struct State {
+    width: usize,
+    height: usize,
+    constants: Constants,
+    cells: Vec<Vec<usize>>,
+    ships: BiMap<Position, ShipId>,
+    cargo: HashMap<ShipId, usize>,
+    dests: HashSet<Position>,
+}
 
-        Navi { width, height, moving: HashMap::new(), occupied }
-    }
+impl State {
+    pub fn from(game: &Game) -> State {
+        let me = &game.players[game.my_id.0];
+        let map = &game.map;
 
-    pub fn get(&self, position: &Position) -> Option<ShipId> {
-        let position = self.normalize(position);
-        self.occupied[position.y as usize][position.x as usize]
-    }
+        let width = map.width;
+        let height = map.height;
+        let constants = game.constants;
+        let cells = map.cells.iter().map(|column| column.iter().map(|cell| cell.halite).collect()).collect();
 
-    pub fn update_frame(&mut self, game: &Game) {
-        self.clear();
+        let ships = BiMap::from_iter(
+            me.ship_ids
+                .iter()
+                .map(|id| (game.ships[id].position, id.clone())),
+        );
 
-        for player in &game.players {
-            for ship_id in &player.ship_ids {
-                let ship = &game.ships[ship_id];
-                self.mark_unsafe_ship(&ship);
-            }
-        }
-    }
+        let cargo = me.ship_ids.iter().map(|id| (id.clone(), game.ships[id].halite)).collect();
 
-    pub fn clear(&mut self) {
-        self.moving.clear();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.occupied[y][x] = None;
-            }
-        }
-    }
+        let mut dests: HashSet<_> = me.dropoff_ids.iter().map(|id| game.dropoffs[id].position).collect();
+        dests.insert(me.shipyard.position);
 
-    pub fn is_safe(&self, position: &Position) -> bool {
-        let position = self.normalize(position);
-        self.occupied[position.y as usize][position.x as usize].is_none()
-    }
-
-    pub fn is_unsafe(&self, position: &Position) -> bool {
-        !self.is_safe(position)
-    }
-
-    pub fn mark_unsafe(&mut self, position: &Position, ship_id: ShipId) {
-        let position = self.normalize(position);
-        self.occupied[position.y as usize][position.x as usize] = Some(ship_id);
-    }
-
-    pub fn mark_safe(&mut self, position: &Position) {
-        let position = self.normalize(position);
-        self.occupied[position.y as usize][position.x as usize] = None;
-    }
-
-    pub fn mark_unsafe_ship(&mut self, ship: &Ship) {
-        self.mark_unsafe(&ship.position, ship.id);
-    }
-
-    pub fn get_unsafe_moves(&self, source: &Position, destination: &Position) -> Vec<Direction> {
-        let normalized_source = self.normalize(source);
-        let normalized_destination = self.normalize(destination);
-
-        let dx = (normalized_source.x - normalized_destination.x).abs() as usize;
-        let dy = (normalized_source.y - normalized_destination.y).abs() as usize;
-
-        let wrapped_dx = self.width - dx;
-        let wrapped_dy = self.height - dy;
-
-        let mut possible_moves: Vec<Direction> = Vec::new();
-
-        if normalized_source.x < normalized_destination.x {
-            possible_moves.push(if dx > wrapped_dx { Direction::West } else { Direction::East });
-        } else if normalized_source.x > normalized_destination.x {
-            possible_moves.push(if dx < wrapped_dx { Direction::West } else { Direction::East });
-        }
-
-        if normalized_source.y < normalized_destination.y {
-            possible_moves.push(if dy > wrapped_dy { Direction::North } else { Direction::South });
-        } else if normalized_source.y > normalized_destination.y {
-            possible_moves.push(if dy < wrapped_dy { Direction::North } else { Direction::South });
-        }
-
-        possible_moves
-    }
-
-    pub fn naive_navigate(&mut self, ship: &Ship, destination: &Position) {
-        let ship_position = ship.position;
-
-        // get_unsafe_moves normalizes for us
-        let directions = self.get_unsafe_moves(&ship_position, destination);
-
-        self.moving.insert(ship.id, (ship_position, directions));
-    }
-
-    pub fn move_ship(&mut self, ship_id: ShipId, old: Position, new: Position) {
-        self.mark_safe(&old);
-        self.mark_unsafe(&new, ship_id);
-    }
-
-    pub fn swap_ships(
-        &mut self,
-        (pos1, ship1): (Position, ShipId),
-        (pos2, ship2): (Position, ShipId),
-    ) {
-        self.mark_unsafe(&pos1, ship2);
-        self.mark_unsafe(&pos2, ship1);
-    }
-
-    pub fn signal_move(
-        &mut self,
-        ship_id: ShipId,
-        moves: &mut Vec<(ShipId, Direction)>,
-        signals: &mut HashMap<Position, HashSet<ShipId>>,
-    ) {
-        let yellow = "#e2f442";
-
-        // If we want to move
-        if let Some((position, directions)) = self.moving.remove(&ship_id) {
-            // For each potential movement direction
-            for dir in directions {
-                let new_pos = self.normalize(&position.directional_offset(dir));
-
-                // Ship at target position
-                if let Some(unsafe_ship) = self.get(&new_pos) {
-                    // Ship wants to swap if they signal for my position
-                    if signals.get_mut(&position).map(|ships| ships.remove(&unsafe_ship)).unwrap_or_default() {
-                        self.swap_ships((position, ship_id), (new_pos, unsafe_ship));
-                        Log::log(position, "_swap1_", yellow);
-                        moves.push((ship_id, dir));
-                        moves.push((unsafe_ship, dir.invert_direction()));
-                        return
-                    }
-
-                    // Ship doesn't want to swap, so signal them to move or swap
-                    signals.entry(new_pos) 
-                        .and_modify(|ships| {
-                            ships.insert(ship_id); 
-                        }).or_insert_with(|| {
-                            let mut ships = HashSet::new();
-                            ships.insert(ship_id);
-                            ships
-                        });
-                    self.signal_move(unsafe_ship, moves, signals);
-
-                    // If we swapped, return
-                    if self.get(&new_pos) == Some(ship_id) {
-                        Log::log(position, "_swap2_", yellow);
-                        return
-                    }
-                }
-
-                // Its safe to move, so move
-                if self.is_safe(&new_pos) {
-                    self.move_ship(ship_id, position, new_pos);
-                    moves.push((ship_id, dir));
-                    return
-                }
-            }
-
-            // No possible move :(
-            Log::log(position, "_nomov_", yellow);
-            moves.push((ship_id, Direction::Still));
+        State {
+            width,
+            height,
+            constants,
+            cells,
+            ships,
+            cargo,
+            dests,
         }
     }
 
-
-    pub fn collect_moves(&mut self) -> Vec<(ShipId, Direction)> {
-        let mut moves: Vec<(ShipId, Direction)> = Vec::new();
-        let ships: Vec<ShipId> = self.moving.keys().cloned().collect();
-
-        for ship_id in ships {
-            self.signal_move(ship_id, &mut moves, &mut HashMap::new());
-        }
-
-        moves
-    }
-
-    pub fn normalize(&self, position: &Position) -> Position {
+    fn normalize(&self, position: Position) -> Position {
         let width = self.width as i32;
         let height = self.height as i32;
         let x = ((position.x % width) + width) % width;
         let y = ((position.y % height) + height) % height;
         Position { x, y }
+    }
+
+    #[inline]
+    fn div(num: usize, by: usize) -> usize {
+        (num + by - 1) / by
+    }
+
+    fn cell(&self, position: Position) -> usize {
+        self.cells[position.y as usize][position.x as usize]
+    }
+
+    /// Creates a command, does not validate if it is possible to execute
+    pub fn command(&self, ship_id: ShipId, direction: Direction) -> Command {
+        if direction == Direction::Still {
+            let position = self.ships.get_by_right(&ship_id).unwrap();
+            let amount = Self::div(self.cell(*position), 4);
+
+            Command::Harvest(ship_id, amount)
+        } else {
+            let old_pos = *self.ships.get_by_right(&ship_id).unwrap();
+            let new_pos = self.normalize(old_pos.directional_offset(direction));
+            let cost = self.cell(old_pos) / self.constants.move_cost_ratio;
+
+            Command::Move(ship_id, old_pos, new_pos, cost)
+        }
+    }
+
+    // Only really makes sense to apply full set of commands at once...
+    // But we want to take advantage of the property:
+    // > value(a + b + c) ~= value(a) + value(b) + value(c)
+    // in order to speed up computation...
+    //
+    // We can likewise think of a value of INT_MIN as an invalid move
+    // > valid(a + b + c) != valid(a) + valid(b) + valid(c), clearly
+    // therefore the privous property for value doesn't hold
+    //
+    // valid(a + b + c) is likely to be true. In the case that it isn't,
+    // how do we speed up the process of finding the next best move set?
+    //
+    // > Reminder, (a, b, c) were chosen since they were the best moves
+    // for each of the three ships, irespective of the others.
+    // i.e. based on a heuristic which considers the other ships current
+    //      position, but doesn't know their future position. 
+    //      (Maybe simply encourages ships to keep their distance, but 
+    //      this would potentially discourage swapping positions).
+    //
+    // This question is equivalent to: if the base ordering by the 
+    // heuristic orders by the sum of the individuals, how do we efficiently
+    // select the next best candidate if the true cost turns out to be bad?
+    //
+    // Three cases this should work for:
+    // 1) Heuristic suggests an invalid move. Simple case, value(a) sufficient
+    // 2) Move is valueable independenly, but not with the group. 
+    //    i.e. Causes a collision
+    // 3) 
+    //
+
+    // pub fn apply(&mut self, command: Command) {
+    // }
+    //
+    // pub fn unapply(&mut self, command: Command) {
+    //
+    // }
+}
+
+pub struct Navi {
+    pub width: usize,
+    pub height: usize,
+    pub moves: Vec<(ShipId, Direction)>,
+    pub paths: HashSet<(Position, usize)>,
+}
+
+impl Navi {
+    pub fn new(width: usize, height: usize) -> Navi {
+        Navi {
+            width,
+            height,
+            moves: Vec::new(),
+            paths: HashSet::new(),
+        }
+    }
+
+    // A node should be the state of the world
+    //
+    // Successors returns a vec of vecs of commands
+    // > Each vec corresponding to the set of commands each ship can execute, unfiltered
+    // commands mutate the state, and should be reversable
+    //
+    // A path is then a vec of vecs of commands
+    // Each turn, we compute a path and apply the first vec of commands
+    //
+    // Given a state, we can compute the value of applying a command
+    // Value is different from a heuristic
+    // Value is absolute, a heuristic is speculative
+    //
+    // Why have both concepts? A heuristic lets you order which paths visit first
+    // Whereas cost is the soure of truth
+    //
+    // Ex.  Minimize cost. Costs to burn fuel. Profits to harvest. But ships have a
+    //      maximum capacity.
+    //
+    //      - Harvest   -> +value
+    //      - Move      -> -fuel
+    //      - Collision?
+    //          - Removes the number of ships, which transitively affects cost
+    //          - Does not directly affect cost, but has a bad heuristic
+    //              - Could be as simple as the cost of the two ships
+    //              - Or could factor in amount of halite left on the board
+    //                and the amount of ships left so that in the late game
+    //                ships are more likely to be sacrificed
+    //
+
+    /// IDA* like search, whereby successors are all combinations
+    fn search<N, usize, FS, FH>(
+        path: &mut Vec<Vec<N>>,
+        cost: usize,
+        bound: usize,
+        successors: &mut FS,
+        heuristic: &mut FH,
+    ) -> Option<usize>
+    where
+        FS: FnMut(&Vec<N>) -> Vec<Vec<N>>,
+        FH: FnMut(&N) -> usize,
+    {
+        None
+    }
+
+    pub fn update_frame(&mut self, game: &Game) {
+        // Clear state
+        self.moves.clear();
+        self.paths.clear();
     }
 }

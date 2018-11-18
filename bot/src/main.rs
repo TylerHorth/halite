@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
+extern crate bimap;
 
 use hlt::command::Command;
 use hlt::game::Game;
@@ -61,132 +62,15 @@ fn main() {
 
         let mut command_queue: Vec<Command> = Vec::new();
 
-        terminal = terminal || me.ship_ids
-            .iter()
-            .cloned()
-            .any(|ship_id| {
-                let ship = &game.ships[&ship_id];
-                let dist = map.calculate_distance(&ship.position, &me.shipyard.position);
-                let turns_remaining = game.constants.max_turns - game.turn_number;
-
-                dist + 15 > turns_remaining
-            });
-
-        if terminal {
-            Log::log(me.shipyard.position, "_terminal_", red);
-
-            // Move towards target
-            for ship_id in me.ship_ids.iter() {
-                let ship = &game.ships[ship_id];
-                let cell = map.at_entity(ship);
-
-                // If we have enough halite to move
-                if ship.halite >= cell.halite / 10 {
-                    let mut unsafe_moves = navi.get_unsafe_moves(&ship.position, &me.shipyard.position).into_iter();
-                    let command = loop {
-                        if let Some(dir) = unsafe_moves.next() {
-                            let target_pos = ship.position.directional_offset(dir);
-
-                            if navi.is_safe(&target_pos) || target_pos == me.shipyard.position {
-                                Log::log(ship.position, format!("_term_{}_", dir.get_char_encoding()), pink);
-                                navi.mark_unsafe(&target_pos, ship.id);
-                                break Some(ship.move_ship(dir));
-                            }
-                        } else {
-                            break None;
-                        }
-                    };
-
-                    if let Some(command) = command {
-                        command_queue.push(command);
-                    } else {
-                        Log::log(ship.position, "_frozen_", teal);
-                        command_queue.push(ship.stay_still());
-                    }
-                } else {
-                    Log::log(ship.position, "_fuel_", orange);
-                    command_queue.push(ship.stay_still());
-                }
-            }
-
-            game.end_turn(&command_queue);
-
-            continue
-        }
-
-        // Remove ships which have reached their target
-        targets.retain(|ship_id, &mut target| { 
-            game.ships
-                .get(&ship_id)
-                .map(|ship| ship.position != target)
-                .unwrap_or_default()
-        });
-
-        // Add targets for ships that don't have one
-        // If can't find target, stay still and log
-        for ship_id in me.ship_ids.iter().cloned() {
-            let ship = &game.ships[&ship_id];
-            let cell = map.at_entity(ship);
-            let taken: HashSet<Position> = targets.values().cloned().collect();
-
-            if !targets.contains_key(&ship_id) {
-                let target = if ship.halite >= ship_full {
-                    // If ship full, return to base
-                    Some(me.shipyard.position)
-                } else if cell.halite < target_halite / 2  {
-                    // If cell not worth mining, find new cell
-                    let mut target = find_target(ship.position, &map, target_halite, &taken);
-                    while target.is_none() {
-                        target_halite = target_halite / 2;
-                        ship_full = 8 * target_halite;
-
-                        Log::log(ship.position, format!("_tar_{}", target_halite), red);
-
-                        target = find_target(ship.position, &map, target_halite, &taken);
-                    }
-
-                    target
-                } else {
-                    // Ship not full, cell worth mining, should stay still
-                    Log::log(ship.position, "_mine_", purple);
-                    None
-                };
-
-                if let Some(target) = target {
-                    targets.insert(ship_id, target); 
-                } else {
-                    // No target. Either cell worth mining, or no target could be found
-                    command_queue.push(ship.stay_still());
-                }
-            }
-        }
-
-        // Move towards target
-        for (ship_id, position) in targets.iter() {
-            // paint target
-            Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
-
-            let ship = &game.ships[ship_id];
-            let cell = map.at_entity(ship);
-
-            // If we have enough halite to move
-            if ship.halite >= cell.halite / 10 {
-                navi.naive_navigate(ship, position);
-            } else {
-                Log::log(ship.position, "_fuel_", orange);
-                command_queue.push(ship.stay_still());
-            }
-        }
-
-
-        for (ship_id, dir) in navi.collect_moves() {
-            Log::log(game.ships[&ship_id].position, format!("_{}_", dir.get_char_encoding()), green);
-            command_queue.push(Command::move_ship(ship_id, dir));
-        }
+        // new HashMap ship_id -> Vec<Position>   /// paths
+        //
+        // for each of my ships, A* a path, avoiding other ships
+        // // use 
 
         if game.turn_number <= game.constants.max_turns / 2 &&
-            me.halite >= game.constants.ship_cost &&
-                navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
+            me.halite >= game.constants.ship_cost //&&
+                //TODO: Detect if one of my ships is going to be on shipyard before creating
+                // navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {
             command_queue.push(me.shipyard.spawn());
         }
