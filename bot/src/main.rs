@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
+extern crate pathfinding;
 
 use hlt::command::Command;
 use hlt::game::Game;
@@ -8,6 +9,7 @@ use hlt::navi::Navi;
 use hlt::ShipId;
 use hlt::log::Log;
 use hlt::position::Position;
+use hlt::flow::FlowField;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -31,6 +33,12 @@ fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Posi
         .map(|cell| cell.position.clone())
 }
 
+fn color(i: usize, h: usize) -> String {
+    let i = (i / 4).min(255);
+    let h = (h / 4).min(255);
+    format!("#{:x}{:x}{:x}", i, h, h)
+}
+
 fn main() {
     let mut game = Game::new();
     let mut navi = Navi::new(game.map.width, game.map.height);
@@ -47,6 +55,11 @@ fn main() {
     let teal = "#42f4ee";
     let pink = "#ff00dc";
 
+    let width = game.map.width as i32;
+    let height = game.map.height as i32;
+
+    let mut flow = FlowField::new(width, height);
+
     Game::ready("bugs");
 
     let mut targets: HashMap<ShipId, Position> = HashMap::new();
@@ -55,6 +68,13 @@ fn main() {
     loop {
         game.update_frame();
         navi.update_frame(&game);
+        flow.update(&game);
+
+        for cell in game.map.iter() {
+            let flow = flow.at(cell.position);
+            // Log::log(cell.position, format!("_f{}_", flow), color(flow, cell.halite));
+            Log::msg(cell.position, format!("_f{}_", flow));
+        }
 
         let me = &game.players[game.my_id.0];
         let map = &game.map;
