@@ -1,4 +1,5 @@
 use bimap::BiMap;
+use std::cmp::Ordering;
 use hlt::colors::*;
 use hlt::direction::Direction;
 use hlt::dropoff::Dropoff;
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 
+#[derive(Eq)]
 enum Command {
     Harvest(ShipId, usize),
     Move(ShipId, Direction, usize),
@@ -158,91 +160,6 @@ impl State {
             }
         }
     }
-
-    pub fn heuristic(&self, cmd: &Command) -> i32 {
-        match cmd {
-            &Command::Move(ship_id, dir, _) => {
-                let old_pos = self.ships.get_by_right(&ship_id).unwrap().clone();
-                let new_pos = self.normalize(old_pos.directional_offset(dir));
-
-                let dist = |pos| self.dests
-                    .iter()
-                    .map(|&dest| State::distance(pos, dest))
-                    .min()
-                    .unwrap();
-
-                let old_dist = dist(old_pos);
-                let new_dist = dist(new_pos);
-
-                let cargo = self.cargo[&ship_id];
-                if cargo > 900 {
-                    old_dist - new_dist
-                } else {
-                    new_dist - old_dist
-                }
-            }
-            &Command::Harvest(..) => -25
-        }
-    }
-
-    // Only really makes sense to apply full set of commands at once...{{{
-    // But we want to take advantage of the property:
-    // > value(a + b + c) ~= value(a) + value(b) + value(c)
-    // in order to speed up computation...
-    //
-    // We can likewise think of a value of INT_MIN as an invalid move
-    // > valid(a + b + c) != valid(a) + valid(b) + valid(c), clearly
-    // therefore the privous property for value doesn't hold
-    //
-    // valid(a + b + c) is likely to be true. In the case that it isn't,
-    // how do we speed up the process of finding the next best move set?
-    //
-    // > Reminder, (a, b, c) were chosen since they were the best moves
-    // for each of the three ships, irespective of the others.
-    // i.e. based on a heuristic which considers the other ships current
-    //      position, but doesn't know their future position. 
-    //      (Maybe simply encourages ships to keep their distance, but 
-    //      this would potentially discourage swapping positions).
-    //
-    // This question is equivalent to: if the base ordering by the 
-    // heuristic orders by the sum of the individuals, how do we efficiently
-    // select the next best candidate if the true cost turns out to be bad?
-    //
-    // Three cases this should work for:
-    // 1) Heuristic suggests an invalid move. Simple case, value(a) sufficient
-    // 2) Move is valueable independenly, but not with the group. 
-    //    i.e. Causes a collision
-    // 3) Move is generally not too good. i.e. blocks another ship from returning
-    //
-    // Problem statement:
-    //   Assuming we have a function heuristic(a) where a is a move for 1 ship
-    //   Find an algorithm which produces a ordered set of moves (a, b, ...)
-    //
-    //   Using the heuristic we can get [a1, a2, ...], [b1, b2, ...], ...
-    //   From this, we want (a, b, ...), (a, b, ...) ordered by value + heuristic
-    //
-    //   heuristic(a, b, ...) is equal to heuristic(a) + heuristic(b) + ...
-    //   So (a1, b1, ...) will be ideal if value is similar 
-    //
-    //   (Value being defined as halite mined - cost of bad moves,
-    //   crashing, invalid moves, etc)
-    //
-    //  
-
-    //  --- Pause
-    // Let's just start out with one ship...
-    // Then we can move onto multiple ships, pathing one at a time...
-    // Finally we'll move onto collaborative pathing, using a product graph
-    //
-    //
-
-
-    // pub fn apply(&mut self, command: Command) {
-    // }
-    //
-    // pub fn unapply(&mut self, command: Command) {
-    //
-    // }}}}
 }
 
 const ALL_DIRS: [Direction; 5] = [
@@ -253,68 +170,86 @@ const ALL_DIRS: [Direction; 5] = [
     Direction::Still,
 ];
 
+#[derive(Eq)]
+struct Node {
+    cmd: Command,
+    value: i32,
+    total: i32,
+}
+
+impl Ord for Node {
+    fn cmp(&self, other: &Node) -> Ordering {
+        self.total.cmp(&other.total)
+    }
+}
+
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Node) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Node) -> bool {
+        self.total == other.total
+    }
+}
+
 pub struct Navi {
     state: State,
-    ship_id: Option<ShipId>,
+    ships: Option<(ShipId, bool)>,
 }
 
 impl Navi {
-    pub fn from(game: &Game) -> Navi {
+    pub fn moves(game: &Game) -> Vec<Command> {
+        let navi = Navi::from(game);
+
+        Vec::new()
+    } 
+
+    fn from(game: &Game) -> Navi {
         let state = State::from(game);
-        let ship_id = state.ships.right_values().cloned().next();
+        let ships = state.ships
+            .right_values()
+            .cloned()
+            .next()
+            .map(|id| (id, state.cargo[&id] > 900));
 
         Navi {
             state,
-            ship_id,
+            ships,
         }
     }
 
-    fn neighbours(&self) -> Vec<(Command, i32, i32)> {
-        let ship_id = self.ship_id.unwrap();
-        let mut cmds: Vec<_> = ALL_DIRS
-            .iter()
-            .map(|dir| self.state.command(ship_id, *dir))
-            .filter(|cmd| self.state.can_apply(&cmd))
-            .map(|cmd| {
-                let v = cmd.value();
-                let h = v + self.state.heuristic(&cmd);
-                (cmd, v, h)
-            })
-            .collect();
 
-        cmds.sort_unstable_by_key(|(.., h)| *h);
+    fn search(&self) {
+        // Target is any tile with halite > X
+        // All ships are moving 
+        // > (Keep it simple, create one path at a time)
+        // - Cannot collide with another ship
+        //
+        // value = (target halite + start halite - move cost / #turns)
+        //
+        // sort by (cell value / distance)
 
-        cmds
     }
 
-    // A node should be the state of the world{{{
+    // fn neighbours(&self) -> Vec<(Command, i32, i32)> {
+    //     let ship_id = self.ship_id.unwrap();
+    //     let mut cmds: Vec<_> = ALL_DIRS
+    //         .iter()
+    //         .map(|dir| self.state.command(ship_id, *dir))
+    //         .filter(|cmd| self.state.can_apply(&cmd))
+    //         .map(|cmd| {
+    //             let v = cmd.value();
+    //             let h = v + self.state.heuristic(&cmd);
+    //             (cmd, v, h)
+    //         })
+    //         .collect();
     //
-    // Successors returns a vec of vecs of commands
-    // > Each vec corresponding to the set of commands each ship can execute, unfiltered
-    // commands mutate the state, and should be reversable
+    //     cmds.sort_unstable_by_key(|(.., h)| *h);
     //
-    // A path is then a vec of vecs of commands
-    // Each turn, we compute a path and apply the first vec of commands
-    //
-    // Given a state, we can compute the value of applying a command
-    // Value is different from a heuristic
-    // Value is absolute, a heuristic is speculative
-    //
-    // Why have both concepts? A heuristic lets you order which paths visit first
-    // Whereas cost is the soure of truth
-    //
-    // Ex.  Minimize cost. Costs to burn fuel. Profits to harvest. But ships have a
-    //      maximum capacity.
-    //
-    //      - Harvest   -> +value
-    //      - Move      -> -fuel
-    //      - Collision?
-    //          - Removes the number of ships, which transitively affects cost
-    //          - Does not directly affect cost, but has a bad heuristic
-    //              - Could be as simple as the cost of the two ships
-    //              - Or could factor in amount of halite left on the board
-    //                and the amount of ships left so that in the late game
-    //                ships are more likely to be sacrificed
-    //
-//}}}
+    //     cmds
+    // }
+
 }
