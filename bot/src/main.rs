@@ -34,7 +34,6 @@ fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Posi
 
 fn main() {
     let mut game = Game::new();
-    let mut navi = Navi::new(game.map.width, game.map.height);
 
     // Constants
     let mut target_halite = game.constants.max_halite / 10;
@@ -55,7 +54,6 @@ fn main() {
 
     loop {
         game.update_frame();
-        navi.update_frame(&game);
 
         let me = &game.players[game.my_id.0];
         let map = &game.map;

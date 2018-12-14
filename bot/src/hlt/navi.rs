@@ -15,7 +15,16 @@ use std::iter::FromIterator;
 
 enum Command {
     Harvest(ShipId, usize),
-    Move(ShipId, Position, Position, usize),
+    Move(ShipId, Direction, usize),
+}
+
+impl Command {
+    pub fn value(&self) -> i32 {
+        match self {
+            &Command::Harvest(.., v) => v as i32,
+            &Command::Move(.., c) => -(c as i32),
+        }
+    }
 }
 
 struct State {
@@ -35,8 +44,11 @@ impl State {
 
         let width = map.width;
         let height = map.height;
-        let constants = game.constants;
-        let cells = map.cells.iter().map(|column| column.iter().map(|cell| cell.halite).collect()).collect();
+        let constants = game.constants.clone();
+        let cells = map.cells
+            .iter()
+            .map(|column| column.iter().map(|cell| cell.halite).collect())
+            .collect();
 
         let ships = BiMap::from_iter(
             me.ship_ids
@@ -44,9 +56,16 @@ impl State {
                 .map(|id| (game.ships[id].position, id.clone())),
         );
 
-        let cargo = me.ship_ids.iter().map(|id| (id.clone(), game.ships[id].halite)).collect();
+        let cargo = me.ship_ids
+            .iter()
+            .map(|id| (id.clone(), game.ships[id].halite))
+            .collect();
 
-        let mut dests: HashSet<_> = me.dropoff_ids.iter().map(|id| game.dropoffs[id].position).collect();
+        let mut dests: HashSet<_> = me.dropoff_ids
+            .iter()
+            .map(|id| game.dropoffs[id].position)
+            .collect();
+
         dests.insert(me.shipyard.position);
 
         State {
@@ -68,6 +87,10 @@ impl State {
         Position { x, y }
     }
 
+    fn distance(a: Position, b: Position) -> i32 {
+        (a.x - b.x).abs() + (a.y - b.y).abs()
+    }
+
     #[inline]
     fn div(num: usize, by: usize) -> usize {
         (num + by - 1) / by
@@ -77,23 +100,92 @@ impl State {
         self.cells[position.y as usize][position.x as usize]
     }
 
+    fn cell_mut(&mut self, position: Position) -> &mut usize {
+        &mut self.cells[position.y as usize][position.x as usize]
+    }
+
     /// Creates a command, does not validate if it is possible to execute
     pub fn command(&self, ship_id: ShipId, direction: Direction) -> Command {
         if direction == Direction::Still {
             let position = self.ships.get_by_right(&ship_id).unwrap();
-            let amount = Self::div(self.cell(*position), 4);
+            let space = self.constants.max_halite - self.cargo[&ship_id];
+            let amount = Self::div(self.cell(*position), self.constants.extract_ratio);
 
-            Command::Harvest(ship_id, amount)
+            Command::Harvest(ship_id, amount.min(space))
         } else {
             let old_pos = *self.ships.get_by_right(&ship_id).unwrap();
-            let new_pos = self.normalize(old_pos.directional_offset(direction));
             let cost = self.cell(old_pos) / self.constants.move_cost_ratio;
 
-            Command::Move(ship_id, old_pos, new_pos, cost)
+            Command::Move(ship_id, direction, cost)
         }
     }
 
-    // Only really makes sense to apply full set of commands at once...
+    pub fn can_apply(&self, cmd: &Command) -> bool {
+        match cmd {
+            &Command::Move(ship_id, _, cost) => cost <= self.cargo[&ship_id],
+            _ => true,
+        }
+    }
+
+    pub fn apply(&mut self, cmd: &Command) {
+        match cmd {
+            &Command::Harvest(ship_id, amount) => {
+                *self.cargo.get_mut(&ship_id).unwrap() += amount;
+                let pos = self.ships.get_by_right(&ship_id).unwrap().clone();
+                *self.cell_mut(pos) -= amount;
+            }
+            &Command::Move(ship_id, dir, cost) => {
+                *self.cargo.get_mut(&ship_id).unwrap() -= cost;
+                let old_pos = self.ships.get_by_right(&ship_id).unwrap().clone();
+                let new_pos = self.normalize(old_pos.directional_offset(dir));
+                self.ships.insert(new_pos, ship_id);
+            }
+        }
+    }
+
+    pub fn unapply(&mut self, cmd: &Command) {
+        match cmd {
+            &Command::Harvest(ship_id, amount) => {
+                *self.cargo.get_mut(&ship_id).unwrap() -= amount;
+                let pos = self.ships.get_by_right(&ship_id).unwrap().clone();
+                *self.cell_mut(pos) += amount;
+            }
+            &Command::Move(ship_id, dir, cost) => {
+                *self.cargo.get_mut(&ship_id).unwrap() += cost;
+                let new_pos = self.ships.get_by_right(&ship_id).unwrap().clone();
+                let old_pos = self.normalize(new_pos.directional_offset(dir.invert_direction()));
+                self.ships.insert(old_pos, ship_id);
+            }
+        }
+    }
+
+    pub fn heuristic(&self, cmd: &Command) -> i32 {
+        match cmd {
+            &Command::Move(ship_id, dir, _) => {
+                let old_pos = self.ships.get_by_right(&ship_id).unwrap().clone();
+                let new_pos = self.normalize(old_pos.directional_offset(dir));
+
+                let dist = |pos| self.dests
+                    .iter()
+                    .map(|&dest| State::distance(pos, dest))
+                    .min()
+                    .unwrap();
+
+                let old_dist = dist(old_pos);
+                let new_dist = dist(new_pos);
+
+                let cargo = self.cargo[&ship_id];
+                if cargo > 900 {
+                    old_dist - new_dist
+                } else {
+                    new_dist - old_dist
+                }
+            }
+            &Command::Harvest(..) => -25
+        }
+    }
+
+    // Only really makes sense to apply full set of commands at once...{{{
     // But we want to take advantage of the property:
     // > value(a + b + c) ~= value(a) + value(b) + value(c)
     // in order to speed up computation...
@@ -120,35 +212,82 @@ impl State {
     // 1) Heuristic suggests an invalid move. Simple case, value(a) sufficient
     // 2) Move is valueable independenly, but not with the group. 
     //    i.e. Causes a collision
-    // 3) 
+    // 3) Move is generally not too good. i.e. blocks another ship from returning
     //
+    // Problem statement:
+    //   Assuming we have a function heuristic(a) where a is a move for 1 ship
+    //   Find an algorithm which produces a ordered set of moves (a, b, ...)
+    //
+    //   Using the heuristic we can get [a1, a2, ...], [b1, b2, ...], ...
+    //   From this, we want (a, b, ...), (a, b, ...) ordered by value + heuristic
+    //
+    //   heuristic(a, b, ...) is equal to heuristic(a) + heuristic(b) + ...
+    //   So (a1, b1, ...) will be ideal if value is similar 
+    //
+    //   (Value being defined as halite mined - cost of bad moves,
+    //   crashing, invalid moves, etc)
+    //
+    //  
+
+    //  --- Pause
+    // Let's just start out with one ship...
+    // Then we can move onto multiple ships, pathing one at a time...
+    // Finally we'll move onto collaborative pathing, using a product graph
+    //
+    //
+
 
     // pub fn apply(&mut self, command: Command) {
     // }
     //
     // pub fn unapply(&mut self, command: Command) {
     //
-    // }
+    // }}}}
 }
 
+const ALL_DIRS: [Direction; 5] = [
+    Direction::North,
+    Direction::East,
+    Direction::South,
+    Direction::West,
+    Direction::Still,
+];
+
 pub struct Navi {
-    pub width: usize,
-    pub height: usize,
-    pub moves: Vec<(ShipId, Direction)>,
-    pub paths: HashSet<(Position, usize)>,
+    state: State,
+    ship_id: Option<ShipId>,
 }
 
 impl Navi {
-    pub fn new(width: usize, height: usize) -> Navi {
+    pub fn from(game: &Game) -> Navi {
+        let state = State::from(game);
+        let ship_id = state.ships.right_values().cloned().next();
+
         Navi {
-            width,
-            height,
-            moves: Vec::new(),
-            paths: HashSet::new(),
+            state,
+            ship_id,
         }
     }
 
-    // A node should be the state of the world
+    fn neighbours(&self) -> Vec<(Command, i32, i32)> {
+        let ship_id = self.ship_id.unwrap();
+        let mut cmds: Vec<_> = ALL_DIRS
+            .iter()
+            .map(|dir| self.state.command(ship_id, *dir))
+            .filter(|cmd| self.state.can_apply(&cmd))
+            .map(|cmd| {
+                let v = cmd.value();
+                let h = v + self.state.heuristic(&cmd);
+                (cmd, v, h)
+            })
+            .collect();
+
+        cmds.sort_unstable_by_key(|(.., h)| *h);
+
+        cmds
+    }
+
+    // A node should be the state of the world{{{
     //
     // Successors returns a vec of vecs of commands
     // > Each vec corresponding to the set of commands each ship can execute, unfiltered
@@ -177,25 +316,5 @@ impl Navi {
     //                and the amount of ships left so that in the late game
     //                ships are more likely to be sacrificed
     //
-
-    /// IDA* like search, whereby successors are all combinations
-    fn search<N, usize, FS, FH>(
-        path: &mut Vec<Vec<N>>,
-        cost: usize,
-        bound: usize,
-        successors: &mut FS,
-        heuristic: &mut FH,
-    ) -> Option<usize>
-    where
-        FS: FnMut(&Vec<N>) -> Vec<Vec<N>>,
-        FH: FnMut(&N) -> usize,
-    {
-        None
-    }
-
-    pub fn update_frame(&mut self, game: &Game) {
-        // Clear state
-        self.moves.clear();
-        self.paths.clear();
-    }
+//}}}
 }
