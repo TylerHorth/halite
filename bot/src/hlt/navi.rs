@@ -204,6 +204,31 @@ impl Navi {
     pub fn moves(game: &Game) -> Vec<Command> {
         let navi = Navi::from(game);
 
+        // Finds best moves for all ships:
+        //
+        //  For each ship:
+        //  > Consider using some heuristic to choose ship priority
+        //
+        //      Sort all tiles by halite effeciency (h/t)
+        //      > Use cell values from final node to avoid mined cells
+        //      
+        //      Use some heuristics to choose N best targets to evaluate the true value of
+        //
+        //      Use astar to determine real value/path to each target
+        //      > Maximizing heuristic is target.value / dist(target, mypos)
+        //      > This is an admissible heuristic as it will allways overestimate
+        //      > since:
+        //      >   We've chosen the maximal halite effeciency tile
+        //      >   It cannot be more efficient to mine than to move
+        //      > unless:
+        //      >   Our selection heuristic elemenated a good cell
+        //
+        //
+        //
+        //
+        //
+        //
+
         Vec::new()
     } 
 
@@ -221,35 +246,5 @@ impl Navi {
         }
     }
 
-
-    fn search(&self) {
-        // Target is any tile with halite > X
-        // All ships are moving 
-        // > (Keep it simple, create one path at a time)
-        // - Cannot collide with another ship
-        //
-        // value = (target halite + start halite - move cost / #turns)
-        //
-        // sort by (cell value / distance)
-
-    }
-
-    // fn neighbours(&self) -> Vec<(Command, i32, i32)> {
-    //     let ship_id = self.ship_id.unwrap();
-    //     let mut cmds: Vec<_> = ALL_DIRS
-    //         .iter()
-    //         .map(|dir| self.state.command(ship_id, *dir))
-    //         .filter(|cmd| self.state.can_apply(&cmd))
-    //         .map(|cmd| {
-    //             let v = cmd.value();
-    //             let h = v + self.state.heuristic(&cmd);
-    //             (cmd, v, h)
-    //         })
-    //         .collect();
-    //
-    //     cmds.sort_unstable_by_key(|(.., h)| *h);
-    //
-    //     cmds
-    // }
 
 }
