@@ -47,7 +47,7 @@ fn main() {
     let teal = "#42f4ee";
     let pink = "#ff00dc";
 
-    Game::ready("bugs");
+    Game::ready("downside");
 
     let mut targets: HashMap<ShipId, Position> = HashMap::new();
     let mut terminal = false;
