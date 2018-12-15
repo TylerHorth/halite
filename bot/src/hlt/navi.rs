@@ -172,10 +172,6 @@ impl Navi {
                     return
                 }
             }
-
-            // No possible move :(
-            Log::log(position, "_nomov_", yellow);
-            moves.push((ship_id, Direction::Still));
         }
     }
 
@@ -184,8 +180,15 @@ impl Navi {
         let mut moves: Vec<(ShipId, Direction)> = Vec::new();
         let ships: Vec<ShipId> = self.moving.keys().cloned().collect();
 
-        for ship_id in ships {
+        for ship_id in ships.iter().cloned() {
             self.signal_move(ship_id, &mut moves, &mut HashMap::new());
+        }
+
+        // Add stay still move for ships which didn't end up moving 
+        for ship_id in ships {
+            if !moves.iter().any(|(id, _)| &ship_id == id) {
+                moves.push((ship_id, Direction::Still));
+            }
         }
 
         moves

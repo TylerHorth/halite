@@ -114,11 +114,11 @@ fn main() {
             continue
         }
 
-        // Remove ships which have reached their target
+        // Remove ships which have reached and mined their target
         targets.retain(|ship_id, &mut target| { 
             game.ships
                 .get(&ship_id)
-                .map(|ship| ship.position != target)
+                .map(|ship| ship.position != target || (map.at_entity(ship).halite >= target_halite / 2 && ship.halite < ship_full)) 
                 .unwrap_or_default()
         });
 
@@ -126,14 +126,14 @@ fn main() {
         // If can't find target, stay still and log
         for ship_id in me.ship_ids.iter().cloned() {
             let ship = &game.ships[&ship_id];
-            let cell = map.at_entity(ship);
             let taken: HashSet<Position> = targets.values().cloned().collect();
 
             if !targets.contains_key(&ship_id) {
+                // If ship is full, return to base
                 let target = if ship.halite >= ship_full {
-                    // If ship full, return to base
                     Some(me.shipyard.position)
-                } else if cell.halite < target_halite / 2  {
+                // Otherwise, find a new cell
+                } else {
                     // If cell not worth mining, find new cell
                     let mut target = find_target(ship.position, &map, target_halite, &taken);
                     while target.is_none() {
@@ -146,22 +146,19 @@ fn main() {
                     }
 
                     target
-                } else {
-                    // Ship not full, cell worth mining, should stay still
-                    Log::log(ship.position, "_mine_", purple);
-                    None
                 };
 
                 if let Some(target) = target {
                     targets.insert(ship_id, target); 
                 } else {
-                    // No target. Either cell worth mining, or no target could be found
+                    // Couldn't find a target. Should never happen.
                     command_queue.push(ship.stay_still());
+                    Log::log(ship.position, "_not_", red);
                 }
             }
         }
 
-        // Move towards target
+        // Move towards target (or mine if already on it)
         for (ship_id, position) in targets.iter() {
             // paint target
             Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
@@ -169,12 +166,19 @@ fn main() {
             let ship = &game.ships[ship_id];
             let cell = map.at_entity(ship);
 
-            // If we have enough halite to move
-            if ship.halite >= cell.halite / 10 {
-                navi.naive_navigate(ship, position);
-            } else {
+            // If we are at mining location
+            if &ship.position == position {
+                Log::log(ship.position, "_mine_", purple);
+                command_queue.push(ship.stay_still());
+
+            // Cant afford to move
+            } else if cell.halite / 10 > ship.halite {
                 Log::log(ship.position, "_fuel_", orange);
                 command_queue.push(ship.stay_still());
+
+            // We have enough halite to move
+            } else {
+                navi.naive_navigate(ship, position);
             }
         }
 
