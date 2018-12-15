@@ -180,7 +180,7 @@ fn main() {
 
             // We have enough halite to move
             } else {
-                navi.naive_navigate(ship, position);
+                navi.naive_navigate(ship, position, map);
             }
         }
 

@@ -2,6 +2,7 @@ use hlt::direction::Direction;
 use hlt::position::Position;
 use hlt::ship::Ship;
 use hlt::ShipId;
+use hlt::game_map::GameMap;
 use hlt::game::Game;
 use hlt::log::Log;
 use std::collections::HashMap;
@@ -99,11 +100,17 @@ impl Navi {
         possible_moves
     }
 
-    pub fn naive_navigate(&mut self, ship: &Ship, destination: &Position) {
+    pub fn naive_navigate(&mut self, ship: &Ship, destination: &Position, map: &GameMap) {
         let ship_position = ship.position;
 
         // get_unsafe_moves normalizes for us
-        let directions = self.get_unsafe_moves(&ship_position, destination);
+        let mut directions = self.get_unsafe_moves(&ship_position, destination);
+
+        directions.sort_unstable_by_key(|dir| {
+            let new_pos = ship_position.directional_offset(*dir);
+            map.at_position(&new_pos).halite
+        });
+
 
         self.moving.insert(ship.id, (ship_position, directions));
     }
