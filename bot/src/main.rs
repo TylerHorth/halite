@@ -191,7 +191,9 @@ fn main() {
         }
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
-        if halite_remaining > total_halite / 2 &&
+        let turn_limit = game.constants.max_turns * 2 / 3;
+
+        if (halite_remaining > total_halite / 2 || game.turn_number > turn_limit) &&
             me.halite >= game.constants.ship_cost &&
                 navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {
