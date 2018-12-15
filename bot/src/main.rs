@@ -47,6 +47,8 @@ fn main() {
     let teal = "#42f4ee";
     let pink = "#ff00dc";
 
+    let total_halite: usize = game.map.iter().map(|cell| cell.halite).sum();
+
     Game::ready("downside");
 
     let mut targets: HashMap<ShipId, Position> = HashMap::new();
@@ -188,7 +190,8 @@ fn main() {
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
-        if game.turn_number <= game.constants.max_turns / 2 &&
+        let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
+        if halite_remaining > total_halite / 2 &&
             me.halite >= game.constants.ship_cost &&
                 navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {
