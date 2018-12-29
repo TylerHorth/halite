@@ -1,43 +1,22 @@
 #[macro_use]
 extern crate lazy_static;
+extern crate pathfinding;
 
-use hlt::command::Command;
-use hlt::game::Game;
-use hlt::game_map::GameMap;
-use hlt::navi::Navi;
-use hlt::ShipId;
-use hlt::log::Log;
-use hlt::position::Position;
+use hlt::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use pathfinding::directed::dijkstra::dijkstra_all;
 
 mod hlt;
-
-fn find_target(pos: Position, map: &GameMap, target: usize, taken: &HashSet<Position>) -> Option<Position> {
-    map.iter()
-        // Cell has target halite
-        .filter(|cell| cell.halite >= target)
-        // Cell isn't already targeted by another ship
-        .filter(|cell| !taken.contains(&cell.position))
-        // Cell is not at current position (sanity)
-        .filter(|cell| cell.position != pos)
-        // Get closest
-        .max_by_key(|cell| {
-            let dist = map.calculate_distance(&pos, &cell.position) as f64;
-            let hal = cell.halite as f64;
-
-            (hal / (dist * dist)) as u64
-        })
-        .map(|cell| cell.position.clone())
-}
 
 fn main() {
     let mut game = Game::new();
     let mut navi = Navi::new(game.map.width, game.map.height);
 
     // Constants
-    let mut target_halite = game.constants.max_halite / 10;
-    let mut ship_full = 9 * target_halite;
+    let min_space = 100;
+    let kernel_size = 8;
 
     // Colors
     let red = "#FF0000";
@@ -49,16 +28,17 @@ fn main() {
 
     let total_halite: usize = game.map.iter().map(|cell| cell.halite).sum();
 
-    Game::ready("downside");
-
-    let mut targets: HashMap<ShipId, Position> = HashMap::new();
     let mut terminal = false;
+    let mut returning: HashSet<ShipId> = HashSet::new();
+    let mut mining: HashMap<Position, (ShipId, usize)> = HashMap::new();
+
+    Game::ready("downside");
 
     loop {
         game.update_frame();
         navi.update_frame(&game);
 
-        let me = &game.players[game.my_id.0];
+        let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
         let map = &game.map;
 
         let mut command_queue: Vec<Command> = Vec::new();
@@ -115,53 +95,120 @@ fn main() {
 
             continue
         }
-
-        // Remove ships which have reached and mined their target
-        targets.retain(|ship_id, &mut target| { 
+        
+        // Remove ships that have reached their target and finished mining/depositing
+        returning.retain(|ship_id| {
             game.ships
-                .get(&ship_id)
-                .map(|ship| ship.position != target || (map.at_entity(ship).halite >= target_halite / 2 && ship.halite < ship_full)) 
+                .get(ship_id)
+                .map(|ship| ship.position != me.shipyard.position)
                 .unwrap_or_default()
         });
 
-        // Add targets for ships that don't have one
-        // If can't find target, stay still and log
-        for ship_id in me.ship_ids.iter().cloned() {
-            let ship = &game.ships[&ship_id];
-            let taken: HashSet<Position> = targets.values().cloned().collect();
+        mining.retain(|_, (ship_id, count)| {
+            game.ships
+                .get(ship_id)
+                .map(|ship| *count > 0 && ship.halite < game.constants.max_halite)
+                .unwrap_or_default()
+        });
+        
+        // Paths from all cells back to the shipyard
+        let shipyard_pos = &me.shipyard.position;
+        let paths_home = dijkstra_all(shipyard_pos, |pos| {
+            let dist = map.calculate_distance(pos, shipyard_pos);
+            pos.get_surrounding_cardinals()
+                .into_iter()
+                .filter(move |p| map.calculate_distance(p, shipyard_pos) > dist)
+                .map(|p| (map.normalize(&p), map.at_position(&p).halite / game.constants.move_cost_ratio))
+        });
 
-            if !targets.contains_key(&ship_id) {
-                // If ship is full, return to base
-                let target = if ship.halite >= ship_full {
-                    Some(me.shipyard.position)
-                // Otherwise, find a new cell
-                } else {
-                    // If cell not worth mining, find new cell
-                    let mut target = find_target(ship.position, &map, target_halite, &taken);
-                    while target.is_none() {
-                        target_halite = target_halite / 2;
-                        ship_full = 8 * target_halite;
+        let mut richness: HashMap<Position, usize> = HashMap::new();
 
-                        Log::log(ship.position, format!("_tar_{}", target_halite), red);
+        // Calculate value of neighbourhood arround each cell
+        for origin in map.iter().map(|cell| cell.position) {
+            let mut q = VecDeque::new();
+            q.push_back((origin, 1));
 
-                        target = find_target(ship.position, &map, target_halite, &taken);
+            let mut seen = HashSet::new();
+            seen.insert(origin);
+
+            let mut sum = 0usize;
+            while let Some((pos, dist)) = q.pop_front() {
+                // sum += map.at_position(&pos).halite / game.constants.extract_ratio;
+                sum += map.at_position(&pos).halite;
+                
+                let dist = dist + 1;
+                if dist < kernel_size {
+                    for next in pos.get_surrounding_cardinals() {
+                        let next = map.normalize(&next);
+                        if !seen.contains(&next) {
+                            q.push_back((next, dist));
+                            seen.insert(next);
+                        }
                     }
-
-                    target
-                };
-
-                if let Some(target) = target {
-                    targets.insert(ship_id, target); 
-                } else {
-                    // Couldn't find a target. Should never happen.
-                    command_queue.push(ship.stay_still());
-                    Log::log(ship.position, "_not_", red);
                 }
             }
+
+            sum /= seen.len();
+
+            richness.insert(origin, sum);
+            Log::msg(origin, format!("_r{}_", sum));
+        }
+
+
+        let ships_mining: HashSet<ShipId> = mining.values().map(|s| s.0).collect();
+        let ship_ids: Vec<ShipId> = me.ship_ids.iter().filter(|id| !ships_mining.contains(id) && !returning.contains(id)).cloned().collect();
+        for ship_id in ship_ids {
+            let ship = &game.ships[&ship_id];
+            let cargo_space = game.constants.max_halite - ship.halite;
+
+            if cargo_space < min_space {
+                returning.insert(ship_id);
+                continue
+            }
+
+            let paths_ship = dijkstra_all(&ship.position, |pos| {
+                let cost = map.at_position(pos).halite / game.constants.move_cost_ratio;
+                let dist = map.calculate_distance(pos, &ship.position);
+                pos.get_surrounding_cardinals()
+                    .into_iter()
+                    .filter(move |p| map.calculate_distance(p, &ship.position) > dist)
+                    .map(move |p| (map.normalize(&p), cost))
+            });
+
+            let mut candidates: Vec<_> = paths_home.iter().map(|(&pos, &(_, cost_home))| {
+                let cost_to = paths_ship.get(&pos).map(|p| p.1).unwrap_or(0);
+                let dist_to = map.calculate_distance(&ship.position, &pos) + 1;
+                let dist_home = map.calculate_distance(&pos, &shipyard_pos) + 1;
+
+                // let halite = map.at_position(&pos).halite / game.constants.extract_ratio;
+                let halite = map.at_position(&pos).halite;
+
+                let value = (halite as i32 - cost_to as i32).min(cargo_space as i32) / dist_to as i32;
+                let value_exp = (richness[&pos] as i32).min(cargo_space as i32 - value) / (dist_to as i32 + kernel_size as i32);
+                let value_home = (halite as i32 - cost_home as i32) / (dist_to as i32 + dist_home as i32);
+
+                // let rate = value + value_exp;
+                let rate = value + (value_exp * cargo_space as i32 / 1000 + value_home * ship.halite as i32 / 1000);
+                // let rate =  if cargo_space > richness[&pos] {
+                //     value + value_exp
+                // } else {
+                //     value + value_home
+                // };
+
+                (pos, 6, rate)
+            }).collect();
+
+            candidates.sort_unstable_by(|a, b| a.2.cmp(&b.2).reverse());
+
+            if let Some(best) = candidates.iter().find(|(p, _, _)| !mining.contains_key(p)) {
+                mining.insert(best.0, (ship_id, best.1));
+            } else {
+                Log::warn("Could not find target");
+            } 
         }
 
         // Move towards target (or mine if already on it)
-        for (ship_id, position) in targets.iter() {
+        for (position, (ship_id, count)) in mining.iter_mut() {
             // paint target
             Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
 
@@ -170,11 +217,12 @@ fn main() {
 
             // If we are at mining location
             if &ship.position == position {
-                Log::log(ship.position, "_mine_", purple);
+                Log::log(ship.position, format!("_m{}_", count), purple);
                 command_queue.push(ship.stay_still());
+                *count -= 1;
 
             // Cant afford to move
-            } else if cell.halite / 10 > ship.halite {
+            } else if cell.halite / game.constants.move_cost_ratio > ship.halite {
                 Log::log(ship.position, "_fuel_", orange);
                 command_queue.push(ship.stay_still());
 
@@ -184,6 +232,27 @@ fn main() {
             }
         }
 
+        for ship_id in returning.iter() {
+            let position = &me.shipyard.position;
+            // paint target
+            Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
+
+            let ship = &game.ships[ship_id];
+            let cell = map.at_entity(ship);
+
+            if &ship.position == position {
+                Log::warn("Already at shipyard, should have set a new target by this point");
+
+            // Cant afford to move
+            } else if cell.halite / game.constants.move_cost_ratio > ship.halite {
+                Log::log(ship.position, "_fuel_", orange);
+                command_queue.push(ship.stay_still());
+
+            // We have enough halite to move
+            } else {
+                navi.naive_navigate(ship, position, map);
+            }
+        }
 
         for (ship_id, dir) in navi.collect_moves() {
             Log::log(game.ships[&ship_id].position, format!("_{}_", dir.get_char_encoding()), green);
@@ -192,6 +261,7 @@ fn main() {
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
         let turn_limit = game.constants.max_turns * 2 / 3;
+        // let turn_limit = 2; //game.constants.max_turns * 2 / 3;
 
         if (halite_remaining > total_halite / 2 && game.turn_number < turn_limit) &&
             me.halite >= game.constants.ship_cost &&

@@ -10,6 +10,8 @@ if [ "$1" == "-d" ]; then
 elif [ "$1" == "-o" ]; then
   cargo build --release
   ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot" "./$2"
+elif [ "$1" == "-m" ]; then
+  ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot" "./$2" "./$3" "./$4" 
 else
   cargo build --release
   ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot" "./target/release/my_bot"

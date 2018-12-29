@@ -24,11 +24,11 @@ impl Display for Message {
         write!(f, "{{ \"t\": {}, \"x\": {}, \"y\": {}", self.turn, self.pos.x, self.pos.y)?;
 
         if let Some(ref message) = self.msg {
-            write!(f, ", \"msg\": \"{}\"", message);
+            write!(f, ", \"msg\": \"{}\"", message)?;
         }
 
         if let Some(ref color) = self.col {
-            write!(f, ", \"color\": \"{}\"", color);
+            write!(f, ", \"color\": \"{}\"", color)?;
         }
 
         write!(f, " }},")
@@ -134,6 +134,10 @@ impl Log {
 
     pub fn info(message: impl Into<String>) {
         Log::flash(message, "#9bc6ff");
+    }
+
+    pub fn warn(message: impl Into<String>) {
+        Log::flash(message, "#ffa500");
     }
 
     pub fn panic(message: impl Into<String>) -> ! {
