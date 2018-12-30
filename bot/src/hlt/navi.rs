@@ -13,6 +13,8 @@ pub struct Navi {
     pub height: usize,
     pub moving: HashMap<ShipId, (Position, Vec<Direction>)>,
     pub occupied: Vec<Vec<Option<ShipId>>>,
+    pub terminal: bool,
+    pub dropoff: Position,
 }
 
 impl Navi {
@@ -22,11 +24,14 @@ impl Navi {
             occupied.push(vec![None; width]);
         }
 
-        Navi { width, height, moving: HashMap::new(), occupied }
+        Navi { width, height, moving: HashMap::new(), occupied, terminal: false, dropoff: Position { x: 0, y: 0 }}
     }
 
     pub fn get(&self, position: &Position) -> Option<ShipId> {
         let position = self.normalize(position);
+        if self.terminal && position == self.dropoff {
+            return None;
+        }
         self.occupied[position.y as usize][position.x as usize]
     }
 
@@ -34,6 +39,10 @@ impl Navi {
         self.clear();
 
         for player in &game.players {
+            if player.id == game.my_id {
+                self.dropoff = player.shipyard.position;
+            }
+
             for ship_id in &player.ship_ids {
                 let ship = &game.ships[ship_id];
                 self.mark_unsafe_ship(&ship);
@@ -52,6 +61,9 @@ impl Navi {
 
     pub fn is_safe(&self, position: &Position) -> bool {
         let position = self.normalize(position);
+        if self.terminal && position == self.dropoff {
+            return true;
+        }
         self.occupied[position.y as usize][position.x as usize].is_none()
     }
 
