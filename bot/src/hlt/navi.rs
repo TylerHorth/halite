@@ -14,7 +14,7 @@ pub struct Navi {
     pub moving: HashMap<ShipId, (Position, Vec<Direction>)>,
     pub occupied: Vec<Vec<Option<ShipId>>>,
     pub terminal: bool,
-    pub dropoff: Position,
+    pub dropoffs: HashSet<Position>,
 }
 
 impl Navi {
@@ -24,12 +24,19 @@ impl Navi {
             occupied.push(vec![None; width]);
         }
 
-        Navi { width, height, moving: HashMap::new(), occupied, terminal: false, dropoff: Position { x: 0, y: 0 }}
+        Navi {
+            width,
+            height,
+            moving: HashMap::new(),
+            occupied,
+            terminal: false,
+            dropoffs: HashSet::new(),
+        }
     }
 
     pub fn get(&self, position: &Position) -> Option<ShipId> {
         let position = self.normalize(position);
-        if self.terminal && position == self.dropoff {
+        if self.terminal && self.dropoffs.contains(&position) {
             return None;
         }
         self.occupied[position.y as usize][position.x as usize]
@@ -40,12 +47,16 @@ impl Navi {
 
         for player in &game.players {
             if player.id == game.my_id {
-                self.dropoff = player.shipyard.position;
+                self.dropoffs = std::iter::once(player.shipyard.position)
+                    .chain(player.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
+                    .collect();
             }
 
             for ship_id in &player.ship_ids {
                 let ship = &game.ships[ship_id];
-                self.mark_unsafe_ship(&ship);
+                if player.id == game.my_id || !self.dropoffs.contains(&ship.position) {
+                    self.mark_unsafe_ship(&ship);
+                }
             }
         }
     }
@@ -61,7 +72,7 @@ impl Navi {
 
     pub fn is_safe(&self, position: &Position) -> bool {
         let position = self.normalize(position);
-        if self.terminal && position == self.dropoff {
+        if self.terminal && self.dropoffs.contains(&position) {
             return true;
         }
         self.occupied[position.y as usize][position.x as usize].is_none()
