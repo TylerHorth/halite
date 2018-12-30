@@ -176,7 +176,7 @@ fn main() {
             let mut converted: Option<ShipId> = None;
             for ship_id in &me.ship_ids {
                 let ship = &game.ships[&ship_id];
-                if (converted.is_none() && map.at_entity(ship).halite + ship.halite + me.halite >= game.constants.dropoff_cost) && prime_ter.contains(&ship.position) {
+                if (converted.is_none() && map.at_entity(ship).structure == Structure::None && map.at_entity(ship).halite + ship.halite + me.halite >= game.constants.dropoff_cost) && prime_ter.contains(&ship.position) {
                     used_halite += game.constants.dropoff_cost - map.at_entity(ship).halite - ship.halite;
                     
                     returning.remove(&ship_id);
