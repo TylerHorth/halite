@@ -3,13 +3,12 @@ use std::iter;
 
 struct Action {
     ship_id: ShipId,
-    dir: Direction,
-    returning: bool,
+    dir: Direction
 }
 
 impl Action {
-    pub fn new(ship_id: ShipId, dir: Direction, returning: bool) -> Action {
-        Action { ship_id, dir, returning }
+    pub fn new(ship_id: ShipId, dir: Direction) -> Action {
+        Action { ship_id, dir }
     }
 }
 
@@ -91,11 +90,16 @@ impl State {
         assert!(dir != Direction::Still, "Staying still is not a move");
 
         let ship = self.ship(ship_id);
-        let cost = div_ceil(self.halite(ship.0), self.move_cost_ratio);
+        let cost = self.halite(ship.0) / self.move_cost_ratio;
         let new_pos = self.normalize(ship.0.directional_offset(dir));
         let new_hal = ship.1.checked_sub(cost).expect("Not enough halite to move");
 
         self.update_ship(ship_id, new_pos, new_hal);
+    }
+
+    #[inline]
+    fn div_ceil(num: usize, by: usize) -> usize {
+        (num + by - 1) / by
     }
 
     fn mine_ship(&mut self, ship_id: ShipId) {
@@ -124,27 +128,5 @@ impl State {
         }
 
         state
-    }
-}
-
-#[inline]
-fn div_ceil(num: usize, by: usize) -> usize {
-    (num + by - 1) / by
-}
-
-struct Node {
-    action: Action,
-    state: State,
-    mined: im::HashSet<Position>,
-    seen: im::HashSet<Position>,
-}
-
-impl Node {
-    const SHIP_FULL: usize = 900;
-
-    fn success(&self) -> bool {
-        let ship_id = self.action.ship_id;
-        let ship = self.state.ship(ship_id);
-        self.state.at_dropoff(ship_id) && ship.1 > Node::SHIP_FULL
     }
 }

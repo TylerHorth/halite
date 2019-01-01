@@ -1,14 +1,344 @@
 #[macro_use]
 extern crate lazy_static;
 extern crate pathfinding;
+extern crate im_rc;
 
+use im_rc as im;
+use std::iter;
+use std::cell::RefCell;
+use std::time::SystemTime;
 use hlt::*;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::BinaryHeap;
 use pathfinding::directed::dijkstra::dijkstra_all;
+use pathfinding::directed::astar::astar;
+use pathfinding::num_traits::identities::Zero;
 
 mod hlt;
+
+struct Action {
+    ship_id: ShipId,
+    dir: Direction
+}
+
+impl Action {
+    pub fn new(ship_id: ShipId, dir: Direction) -> Action {
+        Action { ship_id, dir }
+    }
+}
+
+struct MergedAction {
+    ships: im::HashMap<ShipId, (Position, usize)>,
+}
+
+struct Node {
+    action: Action,
+    value: i32,
+    count: i32,
+    state: State,
+}
+
+impl Eq for Node {}
+
+impl Ord for Node {
+    fn cmp(&self, other: &Node) -> Ordering {
+        self.value.cmp(&other.value)
+    }
+}
+
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Node) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Node) -> bool {
+        self.value == other.value
+    }
+}
+
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+struct Cost(usize, i32);
+
+impl std::ops::Add for Cost {
+    type Output = Cost;
+
+    fn add(self, rhs: Cost) -> Cost {
+        Cost(self.0 + rhs.0, self.1 + rhs.1)
+    }
+}
+
+impl Zero for Cost {
+    fn zero() -> Cost {
+        Cost(0, 0)
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0 == 0 && self.1 == 0
+    }
+}
+
+struct State {
+    map: im::HashMap<Position, usize>,
+    ships: im::HashMap<ShipId, (Position, usize)>,
+    taken: im::HashMap<Position, ShipId>,
+    dropoffs: im::HashSet<Position>,
+    width: usize,
+    height: usize,
+    turn: usize,
+    max_turns: usize,
+    max_halite: usize,
+    extract_ratio: usize,
+    move_cost_ratio: usize,
+}
+
+impl State {
+    pub fn from(game: &Game) -> State {
+        let mut map = im::HashMap::new();
+        for cell in game.map.iter() {
+            map.insert(cell.position, cell.halite);
+        }
+
+        let ships = im::HashMap::new();
+        let taken = im::HashMap::new();
+        let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
+
+        let dropoffs: im::HashSet<Position> = std::iter::once(me.shipyard.position)
+            .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
+            .collect();
+
+        let width = game.map.width;
+        let height = game.map.height;
+        let turn = game.turn_number;
+
+        let max_turns = game.constants.max_turns;
+        let max_halite = game.constants.max_halite;
+        let extract_ratio = game.constants.extract_ratio;
+        let move_cost_ratio = game.constants.move_cost_ratio;
+        
+        State {
+            map,
+            ships,
+            taken,
+            dropoffs,
+            width,
+            height,
+            turn,
+            max_turns,
+            max_halite,
+            extract_ratio,
+            move_cost_ratio,
+        }
+    }
+
+    fn calculate_distance(&self, source: Position, target: Position) -> usize {
+        let normalized_source = self.normalize(source);
+        let normalized_target = self.normalize(target);
+
+        let dx = (normalized_source.x - normalized_target.x).abs() as usize;
+        let dy = (normalized_source.y - normalized_target.y).abs() as usize;
+
+        let toroidal_dx = dx.min(self.width - dx);
+        let toroidal_dy = dy.min(self.height - dy);
+
+        toroidal_dx + toroidal_dy
+    }
+    
+    fn nearest_dropoff(&self, pos: Position) -> Position {
+        self.dropoffs.iter().cloned().min_by_key(|&d| self.calculate_distance(pos, d)).unwrap().clone()
+    }
+
+    fn normalize(&self, position: Position) -> Position {
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let x = ((position.x % width) + width) % width;
+        let y = ((position.y % height) + height) % height;
+        Position { x, y }
+    }
+
+    fn halite(&self, pos: Position) -> usize {
+        self.map[&pos]
+    }
+
+    fn update_hal(&mut self, pos: Position, hal: usize) {
+        self.map.insert(pos, hal).expect(&format!("No cell at pos ({}, {})", pos.x, pos.y));
+    }
+
+    fn ship(&self, ship_id: ShipId) -> (Position, usize) {
+        self.ships[&ship_id]
+    }
+
+    fn update_ship(&mut self, ship_id: ShipId, pos: Position, hal: usize) {
+        let ship = self.ships.get_mut(&ship_id).expect(&format!("No ship with id {}", ship_id.0));
+        self.taken.remove(&ship.0);
+        self.taken.insert(pos, ship_id);
+        *ship = (pos, hal);
+    }
+
+    fn at_dropoff(&self, ship_id: ShipId) -> bool {
+        self.dropoffs.contains(&self.ship(ship_id).0)
+    }
+
+    pub fn get_dir(&self, source: Position, destination: Position) -> Direction {
+        let normalized_source = self.normalize(source);
+        let normalized_destination = self.normalize(destination);
+
+        if normalized_source == normalized_destination {
+            return Direction::Still;
+        }
+
+        let dx = (normalized_source.x - normalized_destination.x).abs() as usize;
+        let dy = (normalized_source.y - normalized_destination.y).abs() as usize;
+
+        let wrapped_dx = self.width - dx;
+        let wrapped_dy = self.height - dy;
+
+        if normalized_source.x < normalized_destination.x {
+            if dx > wrapped_dx { 
+                return Direction::West 
+            } else { 
+                return Direction::East 
+            }
+        } else if normalized_source.x > normalized_destination.x {
+            if dx < wrapped_dx { 
+                return Direction::West 
+            } else {
+                return Direction::East 
+            }
+        }
+
+        if normalized_source.y < normalized_destination.y {
+            if dy > wrapped_dy { 
+                return Direction::North 
+            } else {
+                return Direction::South 
+            }
+        } else if normalized_source.y > normalized_destination.y {
+            if dy < wrapped_dy {
+                return Direction::North 
+            } else {
+                return Direction::South 
+            }
+        }
+
+        panic!("This should never happen");
+    }
+
+    fn move_ship(&mut self, ship_id: ShipId, dir: Direction) -> i32 {
+        assert!(dir != Direction::Still, "Staying still is not a move");
+
+        let ship = self.ship(ship_id);
+        let cost = self.halite(ship.0) / self.move_cost_ratio;
+        let new_pos = self.normalize(ship.0.directional_offset(dir));
+        let new_hal = ship.1.checked_sub(cost).expect("Not enough halite to move");
+
+        self.update_ship(ship_id, new_pos, new_hal);
+
+        cost as i32
+    }
+
+    fn mine_ship(&mut self, ship_id: ShipId) -> i32 {
+        let ship = self.ship(ship_id);
+        let pos = ship.0;
+        let hal = self.halite(pos);
+        let cap = self.max_halite - ship.1;
+        let mined = div_ceil(hal, self.extract_ratio).min(cap);
+
+        self.update_hal(pos, hal - mined);
+        self.update_ship(ship_id, pos, ship.1 + mined);
+
+        mined as i32 * -1
+    }
+
+    pub fn turns_remaining(&self) -> usize {
+        self.max_turns - self.turn
+    }
+
+    pub fn actions(&self, ship_id: ShipId) -> Vec<Action> {
+        let (position, halite) = self.ships[&ship_id];
+
+        let cost = self.map[&position] / self.move_cost_ratio;
+        let mut actions = Vec::new();
+
+        if self.turns_remaining() > 0 {
+            if halite >= cost {
+                Direction::get_all_cardinals()
+                    .into_iter()
+                    .filter_map(|dir| {
+                        let new_pos = self.normalize(position.directional_offset(dir));
+                        if !self.taken.contains_key(&new_pos) {
+                            Some(Action::new(ship_id, dir))
+                        } else { 
+                            None 
+                        }
+                    }).for_each(|action| actions.push(action));
+            } 
+
+            actions.push(Action::new(ship_id, Direction::Still))
+        }
+
+        actions
+    }
+
+    pub fn with_ship(&self, ship: &Ship) -> State {
+        let mut state = self.clone();
+
+        state.ships.insert(ship.id, (ship.position, ship.halite));
+        state.taken.insert(ship.position, ship.id);
+
+        state
+    }
+
+    pub fn apply(&self, action: Action) -> (State, i32) {
+        let mut state = self.clone();
+        state.turn += 1;
+
+        let value = match action.dir {
+            Direction::Still => state.mine_ship(action.ship_id),
+            dir => state.move_ship(action.ship_id, dir),
+        };
+
+        (state, value)
+    }
+
+    pub fn apply_all(&self, actions: impl IntoIterator<Item=Action>) -> (State, i32) {
+        let mut state = self.clone();
+        state.turn += 1;
+
+        let mut total = 0;
+        for action in actions {
+            let value = match action.dir {
+                Direction::Still => state.mine_ship(action.ship_id),
+                dir => state.move_ship(action.ship_id, dir),
+            };
+
+            total += value;
+        }
+
+        (state, total)
+    }
+}
+
+impl Clone for State {
+    fn clone(&self) -> State {
+        State {
+            map: self.map.clone(),
+            ships: self.ships.clone(),
+            taken: self.taken.clone(),
+            dropoffs: self.dropoffs.clone(),
+            ..*self
+        }
+    }
+}
+
+#[inline]
+fn div_ceil(num: usize, by: usize) -> usize {
+    (num + by - 1) / by
+}
 
 fn main() {
     let mut game = Game::new();
@@ -17,6 +347,7 @@ fn main() {
     // Constants
     let min_space = 100;
     let kernel_size = 8;
+    let max_lookahead = 50;
 
     // Colors
     let red = "#FF0000";
@@ -50,23 +381,23 @@ fn main() {
         let nearest_dropoff = |pos: Position| dropoffs.iter().min_by_key(|d| map.calculate_distance(&pos, d)).unwrap().clone();
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
-        let turn_limit = game.constants.max_turns * 2 / 3;
-        // let turn_limit = 2; //game.constants.max_turns * 2 / 3;
+        // let turn_limit = game.constants.max_turns * 2 / 3;
+        let turn_limit = 2; //game.constants.max_turns * 2 / 3;
         
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
 
         let mut used_halite = 0usize;
 
-        terminal = terminal || me.ship_ids
-            .iter()
-            .cloned()
-            .any(|ship_id| {
-                let ship = &game.ships[&ship_id];
-                let dist = map.calculate_distance(&ship.position, &nearest_dropoff(ship.position));
-                let turns_remaining = game.constants.max_turns - game.turn_number;
-
-                dist + 7 > turns_remaining
-            });
+        // terminal = terminal || me.ship_ids
+        //     .iter()
+        //     .cloned()
+        //     .any(|ship_id| {
+        //         let ship = &game.ships[&ship_id];
+        //         let dist = map.calculate_distance(&ship.position, &nearest_dropoff(ship.position));
+        //         let turns_remaining = game.constants.max_turns - game.turn_number;
+        //
+        //         dist + 7 > turns_remaining
+        //     });
 
         if terminal {
             Log::log(me.shipyard.position, "_terminal_", red);
@@ -143,7 +474,7 @@ fn main() {
                 r_count = seen.len();
 
                 richness.insert(origin, sum);
-                Log::msg(origin, format!("_r{}_", sum));
+                // DEBUG: Log::msg(origin, format!("_r{}_", sum));
             }
 
             let prime_ter: HashSet<Position> = if early_game {
@@ -161,7 +492,7 @@ fn main() {
                         avg_halite_after * num_ships * turns_remaining > avg_halite_before * (num_ships + 6) * turns_remaining - (dist * avg_halite_before + cost_home) * (num_ships + 6) / dropoffs.len()
                     })
                     .map(|(&pos, _)| {
-                        Log::color(pos, yellow);
+                        // DEBUG: Log::color(pos, yellow);
                         pos
                     })
                     .collect()
@@ -241,6 +572,7 @@ fn main() {
 
             // Move towards target (or mine if already on it)
             for (position, (ship_id, count)) in mining.iter_mut() {
+                continue;
                 // paint target
                 Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
 
@@ -263,9 +595,127 @@ fn main() {
                     navi.naive_navigate(ship, position, map);
                 }
             }
+
+            {
+                let start_time = SystemTime::now();
+                for &ship_id in me.ship_ids.iter() {
+                    let mut states = RefCell::new(HashMap::new());
+
+                    let ship = &game.ships[&ship_id];
+                    let start = (ship.position, 0, 0);
+                    let local_key = (ship.position, 0);
+                    states.borrow_mut().insert(local_key, (State::from(&game).with_ship(&ship), 0));
+
+                    let path = astar(
+                        &start,
+                        |&key| {
+                            let local_key = (key.0, key.1);
+                            let (successors, value): (Vec<_>, i32) = {
+                                let (state, value) = &states.borrow()[&local_key];
+                                let mut actions = state.actions(ship_id);
+
+                                (actions.into_iter().map(|action| state.apply(action)).collect(), *value)
+                            };
+
+                            let res: Vec<_> = successors.into_iter()
+                                .filter_map(|(state, cost)| {
+                                    let new_val = value + cost;
+                                    let key = (state.ship(ship_id).0, key.1 + 1, new_val);
+                                    let local_key = (key.0, key.1);
+                                    if states.borrow().contains_key(&local_key) {
+                                        let mut old_state = states.borrow_mut();
+                                        let prev = old_state.get_mut(&local_key).unwrap();
+                                        if new_val < prev.1 {
+                                            *prev = (state, new_val);
+                                            Some((key, Cost(1, cost)))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        states.borrow_mut().insert(local_key, (state, new_val));
+                                        Some((key, Cost(1, cost)))
+                                    }
+                                }).collect();
+
+                            res
+                        },
+                        |&(pos, t, _)| {
+                            let state = &states.borrow()[&(pos, t)].0;
+                            let (pos, hal) = state.ship(ship_id);
+                            let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+
+                            Cost(dist, state.max_halite as i32 - hal as i32)
+                        },
+                        |&(pos, t, _)| {
+                            let state = &states.borrow()[&(pos, t)].0;
+                            let (pos, hal) = state.ship(ship_id);
+                            let turn_limit = max_lookahead.min(state.turns_remaining());
+                            t >= turn_limit || (hal > 950 && dropoffs.contains(&pos))
+                        }
+                    );
+
+                    let duration = SystemTime::now().duration_since(start_time).expect("Time goes forwards");
+                    Log::info(format!("Time: {:?}", duration));
+
+                    if let Some((path, _)) = path {
+                        if let Some(&(pos, t, _)) = path.get(1) {
+                            let state = &states.borrow()[&(pos, t)].0;
+                            command_queue.push(Command::move_ship(ship_id, state.get_dir(ship.position, pos)));
+                        }
+                        for (pos, t, hal) in path {
+                            Log::log(pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
+                        }
+                    } else {
+                        Log::warn(format!("No path found for ship {}", ship_id.0));
+                    }
+                }
+
+                // for (&target, &(ship_id, _)) in mining.iter() {
+                //     let mut states = HashMap::new();
+                //
+                //     let ship = &game.ships[&ship_id];
+                //     let start = (ship.position, 0);
+                //     states.insert(start, State::from(&game).with_ship(&ship));
+                //
+                //     let path = astar(
+                //         &start,
+                //         |&key| {
+                //             let successors: Vec<_> = {
+                //                 let state = &states[&key];
+                //                 let mut actions = state.actions(ship_id);
+                //                 // if actions.is_empty() {
+                //                     actions.push(Action { ship_id, dir: Direction::Still });
+                //                 // }
+                //
+                //                 actions.into_iter().map(|action| state.apply(action)).collect()
+                //             };
+                //
+                //             let res: Vec<_> = successors.into_iter()
+                //                 .map(|(state, value)| {
+                //                     let key = (state.ship(ship_id).0, key.1 + 1);
+                //                     states.insert(key, state);
+                //                     (key, Cost(1, value))
+                //                 }).collect();
+                //
+                //             res
+                //         },
+                //         |key| Cost(map.calculate_distance(&key.0, &target), 0),
+                //         |&(pos, _)| pos == target
+                //     );
+                //
+                //     if let Some((path, _)) = path {
+                //         for (pos, t) in path {
+                //             Log::log(pos, format!("-ship[{}:t{}]-", ship_id.0, t), yellow);
+                //         }
+                //     } else {
+                //         Log::warn(format!("No path found from ship {} to ({}, {})", ship_id.0, target.x, target.y));
+                //     }
+                // }
+            }
         }
 
         for (ship_id, position) in returning.iter() {
+            continue;
             // paint target
             Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
 
@@ -287,6 +737,7 @@ fn main() {
         }
 
         for (ship_id, dir) in navi.collect_moves() {
+            continue;
             Log::log(game.ships[&ship_id].position, format!("_{}_", dir.get_char_encoding()), green);
             command_queue.push(Command::move_ship(ship_id, dir));
         }

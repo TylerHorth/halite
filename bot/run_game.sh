@@ -17,7 +17,7 @@ elif [ "$1" == "-m" ]; then
   ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot" "./$2" "./$3" "./$4" 
 else
   cargo build --release
-  ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot" "./target/release/my_bot"
+  ./halite --replay-directory replays/ -vvv --width $SIZE --height $SIZE "./target/release/my_bot"
 fi
 
 cat bot-0.log >bot.log
