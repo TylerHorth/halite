@@ -13,12 +13,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::BinaryHeap;
-use pathfinding::directed::dijkstra::dijkstra_all;
 use pathfinding::directed::astar::astar;
 use pathfinding::num_traits::identities::Zero;
 
 mod hlt;
 
+#[derive(Copy, Clone)]
 struct Action {
     ship_id: ShipId,
     dir: Direction
@@ -30,35 +30,12 @@ impl Action {
     }
 }
 
+#[derive(Clone)]
 struct MergedAction {
-    ships: im::HashMap<ShipId, (Position, usize)>,
-}
-
-struct Node {
-    action: Action,
-    value: i32,
-    count: i32,
-    state: State,
-}
-
-impl Eq for Node {}
-
-impl Ord for Node {
-    fn cmp(&self, other: &Node) -> Ordering {
-        self.value.cmp(&other.value)
-    }
-}
-
-impl PartialOrd for Node {
-    fn partial_cmp(&self, other: &Node) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Node {
-    fn eq(&self, other: &Node) -> bool {
-        self.value == other.value
-    }
+    ship_id: ShipId,
+    pos: Position,
+    halite: usize,
+    mined: im::HashMap<Position, usize>
 }
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
@@ -82,11 +59,21 @@ impl Zero for Cost {
     }
 }
 
+// Ship halite not tracked (not important)
+struct Diff {
+    map: Vec<(Position, i32)>,
+    ships: Vec<(ShipId, Position, Position)>,
+    dropoffs: Vec<Position>,
+    halite: i32,
+    turn: i32,
+}
+
 struct State {
     map: im::HashMap<Position, usize>,
     ships: im::HashMap<ShipId, (Position, usize)>,
     taken: im::HashMap<Position, ShipId>,
     dropoffs: im::HashSet<Position>,
+    halite: usize,
     width: usize,
     height: usize,
     turn: usize,
@@ -106,6 +93,7 @@ impl State {
         let ships = im::HashMap::new();
         let taken = im::HashMap::new();
         let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
+        let halite = me.halite;
 
         let dropoffs: im::HashSet<Position> = std::iter::once(me.shipyard.position)
             .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
@@ -125,6 +113,7 @@ impl State {
             ships,
             taken,
             dropoffs,
+            halite,
             width,
             height,
             turn,
@@ -234,11 +223,18 @@ impl State {
         let ship = self.ship(ship_id);
         let cost = self.halite(ship.0) / self.move_cost_ratio;
         let new_pos = self.normalize(ship.0.directional_offset(dir));
-        let new_hal = ship.1.checked_sub(cost).expect("Not enough halite to move");
+        let after_move = ship.1.checked_sub(cost).expect("Not enough halite to move");
+
+        let (new_hal, val) = if self.dropoffs.contains(&new_pos) {
+            self.halite += after_move;
+            (0, cost as i32)
+        } else {
+            (after_move, cost as i32)
+        };
 
         self.update_ship(ship_id, new_pos, new_hal);
 
-        cost as i32
+        val
     }
 
     fn mine_ship(&mut self, ship_id: ShipId) -> i32 {
@@ -278,7 +274,9 @@ impl State {
                     }).for_each(|action| actions.push(action));
             } 
 
-            actions.push(Action::new(ship_id, Direction::Still))
+            if self.taken[&position] == ship_id {
+                actions.push(Action::new(ship_id, Direction::Still))
+            }
         }
 
         actions
@@ -293,33 +291,119 @@ impl State {
         state
     }
 
-    pub fn apply(&self, action: Action) -> (State, i32) {
+    pub fn add_ship(&mut self, ship: &Ship) {
+        self.ships.insert(ship.id, (ship.position, ship.halite));
+        self.taken.insert(ship.position, ship.id);
+    }
+
+    pub fn rm_ship(&mut self, ship_id: ShipId) {
+        let (position, _) = self.ships.remove(&ship_id).expect("Cannot remove ship");
+        self.taken.remove(&position);
+    }
+
+    pub fn diff(&self, other: &State) -> Diff {
+        let mut map = Vec::new();
+        for &(pos, val) in self.map.iter() {
+            let diff = other.halite(pos) as i32 - val as i32;
+            if diff != 0 {
+                map.push((pos, diff));
+            }
+        }
+
+        let mut ships = Vec::new();
+        for &(ship_id, (pos, _)) in self.ships.iter() {
+            let other_pos = other.ship(ship_id).0;
+            if other_pos != pos {
+                ships.push((ship_id, pos, other_pos));
+            }
+        }
+
+        let mut dropoffs = Vec::new();
+        for &dropoff_pos in other.dropoffs.iter() {
+            if !self.dropoffs.contains(&dropoff_pos) {
+                dropoffs.push(dropoff_pos);
+            }
+        }
+
+        let halite = other.halite as i32 - self.halite as i32;
+        let turn = other.turn as i32 - self.turn as i32;
+
+        Diff {
+            map: map,
+            ships: ships,
+            dropoffs: dropoffs,
+            halite: halite,
+            turn: turn,
+        }
+    }
+
+    pub fn merge(&self, diff: &Diff) -> State {
+        let mut state = self.clone();
+
+        for &(pos, hal) in &diff.map {
+            if hal > 0 {
+                state.map[&pos] += hal as usize;
+            } else {
+                state.map[&pos] -= -hal as usize;
+            }
+        }
+
+        for &(ship_id, old_pos, new_pos) in &diff.ships {
+            state.ships[&ship_id].0 = new_pos;
+            state.taken.remove(&old_pos);
+            state.taken.insert(new_pos, ship_id);
+        }
+
+        for &dropoff_pos in &diff.dropoffs {
+            state.dropoffs.insert(dropoff_pos);
+        }
+
+        if diff.halite > 0 {
+            state.halite += diff.halite as usize;
+        } else {
+            state.halite -= -diff.halite as usize;
+        }
+
+        if diff.turn > 0 {
+            state.turn += diff.turn as usize;
+        } else {
+            state.turn -= -diff.turn as usize;
+        }
+
+        state
+    }
+
+    pub fn next(&self) -> State {
         let mut state = self.clone();
         state.turn += 1;
 
-        let value = match action.dir {
-            Direction::Still => state.mine_ship(action.ship_id),
-            dir => state.move_ship(action.ship_id, dir),
-        };
+        state
+    }
+
+    pub fn can_apply(&self, action: Action) -> bool {
+        match action.dir {
+            Direction::Still => true,
+            _ => {
+                let (pos, hal) = self.ship(action.ship_id);
+                let cost = self.map[&pos] / self.move_cost_ratio;
+                hal >= cost
+            }
+        }
+    }
+
+    pub fn apply(&self, action: Action) -> (State, i32) {
+        let mut state = self.next();
+
+        let value = state.apply_mut(action);
 
         (state, value)
     }
 
-    pub fn apply_all(&self, actions: impl IntoIterator<Item=Action>) -> (State, i32) {
-        let mut state = self.clone();
-        state.turn += 1;
-
-        let mut total = 0;
-        for action in actions {
-            let value = match action.dir {
-                Direction::Still => state.mine_ship(action.ship_id),
-                dir => state.move_ship(action.ship_id, dir),
-            };
-
-            total += value;
+    pub fn apply_mut(&mut self, action: Action) -> i32 {
+        match action.dir {
+            Direction::Still => self.mine_ship(action.ship_id),
+            dir => self.move_ship(action.ship_id, dir),
         }
-
-        (state, total)
     }
 }
 
@@ -345,9 +429,7 @@ fn main() {
     let mut navi = Navi::new(game.map.width, game.map.height);
 
     // Constants
-    let min_space = 100;
-    let kernel_size = 8;
-    let max_lookahead = 50;
+    let max_lookahead = 100;
 
     // Colors
     let red = "#FF0000";
@@ -359,395 +441,214 @@ fn main() {
 
     let total_halite: usize = game.map.iter().map(|cell| cell.halite).sum();
 
-    let mut terminal = false;
-    let mut returning: HashMap<ShipId, Position> = HashMap::new();
-    let mut mining: HashMap<Position, (ShipId, usize)> = HashMap::new();
+    // State
+    let mut paths: HashMap<ShipId, VecDeque<Direction>> = HashMap::new();
 
     Game::ready("downside");
 
     loop {
+        let start_time = SystemTime::now();
+
         game.update_frame();
         navi.update_frame(&game);
 
         let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
-        let map = &game.map;
 
         let mut command_queue: Vec<Command> = Vec::new();
-
-        let dropoffs: Vec<Position> = std::iter::once(me.shipyard.position)
-            .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
-            .collect();
-
-        let nearest_dropoff = |pos: Position| dropoffs.iter().min_by_key(|d| map.calculate_distance(&pos, d)).unwrap().clone();
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
         // let turn_limit = game.constants.max_turns * 2 / 3;
         let turn_limit = 2; //game.constants.max_turns * 2 / 3;
-        
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
 
-        let mut used_halite = 0usize;
+        let ship_ids: HashSet<ShipId> = me.ship_ids.iter().cloned().collect();
+        paths.retain(|ship_id, path| ship_ids.contains(ship_id) && !path.is_empty());
 
-        // terminal = terminal || me.ship_ids
-        //     .iter()
-        //     .cloned()
-        //     .any(|ship_id| {
-        //         let ship = &game.ships[&ship_id];
-        //         let dist = map.calculate_distance(&ship.position, &nearest_dropoff(ship.position));
-        //         let turns_remaining = game.constants.max_turns - game.turn_number;
-        //
-        //         dist + 7 > turns_remaining
-        //     });
+        let mut state = State::from(&game);
+        for ship_id in paths.keys() {
+            let ship = &game.ships[ship_id];
+            state.add_ship(ship);
+        }
 
-        if terminal {
-            Log::log(me.shipyard.position, "_terminal_", red);
-            mining.clear();
-            returning.clear();
-            navi.terminal = true;
-
-            for ship_id in me.ship_ids.iter().cloned() {
-                let ship = &game.ships[&ship_id];
-                returning.insert(ship_id, nearest_dropoff(ship.position));
-            }
-        } else {
-            // Remove ships that have reached their target and finished mining/depositing
-            returning.retain(|ship_id, pos| {
-                game.ships
-                    .get(ship_id)
-                    .map(|ship| &ship.position != pos)
-                    .unwrap_or_default()
-            });
-
-            mining.retain(|_, (ship_id, count)| {
-                game.ships
-                    .get(ship_id)
-                    .map(|ship| *count > 0 && ship.halite < game.constants.max_halite)
-                    .unwrap_or_default()
-            });
-            
-            // Paths (cost) from all cells back to nearest dropoff
-            let paths_dropoff = dropoffs.iter().map(|dropoff| {
-                dijkstra_all(dropoff, |pos| {
-                    let dist = map.calculate_distance(pos, dropoff);
-                    pos.get_surrounding_cardinals()
-                        .into_iter()
-                        .filter(move |p| map.calculate_distance(p, dropoff) > dist)
-                        .map(|p| (map.normalize(&p), map.at_position(&p).halite / game.constants.move_cost_ratio))
-                })
-            }).fold(HashMap::new(), |mut res: HashMap<Position, usize>, cur| {
-                for (pos, (_, cost)) in cur {
-                    res.entry(pos)
-                        .and_modify(|c| *c = (*c).min(cost))
-                        .or_insert(cost);
-                }
-                res
-            });
-
-            let mut richness: HashMap<Position, usize> = HashMap::new();
-            let mut r_count = 0;
-
-            // Calculate value of neighbourhood arround each cell
-            for origin in map.iter().map(|cell| cell.position) {
-                let mut q = VecDeque::new();
-                q.push_back((origin, 1));
-
-                let mut seen = HashSet::new();
-                seen.insert(origin);
-
-                let mut sum = 0usize;
-                while let Some((pos, dist)) = q.pop_front() {
-                    // sum += map.at_position(&pos).halite / game.constants.extract_ratio;
-                    sum += map.at_position(&pos).halite;
-                    
-                    let dist = dist + 1;
-                    if dist < kernel_size {
-                        for next in pos.get_surrounding_cardinals() {
-                            let next = map.normalize(&next);
-                            if !seen.contains(&next) {
-                                q.push_back((next, dist));
-                                seen.insert(next);
-                            }
-                        }
-                    }
+        let mut actions: Vec<Vec<Action>> = Vec::new();
+        for (&ship_id, dirs) in &paths {
+            for (i, &dir) in dirs.iter().enumerate() {
+                if i >= actions.len() {
+                    actions.push(Vec::new());
                 }
 
-                r_count = seen.len();
-
-                richness.insert(origin, sum);
-                // DEBUG: Log::msg(origin, format!("_r{}_", sum));
+                actions[i].push(Action::new(ship_id, dir));
             }
+        }
 
-            let prime_ter: HashSet<Position> = if early_game {
-                let passive_halite = halite_remaining / map.width / map.height * 7 / 8;
-                let dropoff_richness: usize = dropoffs.iter().map(|d| richness[d]).sum();
-                let avg_halite_before = dropoff_richness / dropoffs.len() / r_count / 8 + passive_halite;
-                let turns_remaining = game.constants.max_turns - game.turn_number;
-                let num_ships = me.ship_ids.len();
+        let mut timeline: Vec<State> = vec![state];
+        let mut diffs: Vec<Diff> = Vec::new();
+        let mut poisoned: HashMap<ShipId, usize> = HashMap::new();
+        let mut mined: HashMap<Position, usize> = HashMap::new();
 
-                richness.iter()
-                    .filter(|(&pos, &sum)| {
-                        let dist = map.calculate_distance(&nearest_dropoff(pos), &pos);
-                        let cost_home = paths_dropoff.get(&pos).unwrap_or(&0);
-                        let avg_halite_after = (dropoff_richness + sum) / (dropoffs.len() + 1) / r_count / 8 + passive_halite;
-                        avg_halite_after * num_ships * turns_remaining > avg_halite_before * (num_ships + 6) * turns_remaining - (dist * avg_halite_before + cost_home) * (num_ships + 6) / dropoffs.len()
-                    })
-                    .map(|(&pos, _)| {
-                        // DEBUG: Log::color(pos, yellow);
-                        pos
-                    })
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+        for (i, step) in actions.into_iter().enumerate() {
+            let state = timeline[i].next();
+            timeline.push(state);
 
-            if !prime_ter.is_empty() { 
-                used_halite += game.constants.dropoff_cost;   
-            }
+            let state = timeline.last_mut().unwrap();
+            for action in step {
+                if !poisoned.contains_key(&action.ship_id) {
+                    if state.can_apply(action) {
+                        state.apply_mut(action);
 
-            let mut converted: Option<ShipId> = None;
-            for ship_id in &me.ship_ids {
-                let ship = &game.ships[&ship_id];
-                if (converted.is_none() && map.at_entity(ship).structure == Structure::None && map.at_entity(ship).halite + ship.halite + me.halite >= game.constants.dropoff_cost) && prime_ter.contains(&ship.position) {
-                    used_halite += game.constants.dropoff_cost - map.at_entity(ship).halite - ship.halite;
-                    
-                    returning.remove(&ship_id);
-                    mining.retain(|_, (id, _)| id != ship_id);
-
-                    command_queue.push(ship.make_dropoff());
-                    converted = Some(*ship_id);
-                }
-            }
-
-            let ships_mining: HashSet<ShipId> = mining.values().map(|s| s.0).collect();
-            let ship_ids: Vec<ShipId> = me.ship_ids.iter().filter(|id| !ships_mining.contains(id) && !returning.contains_key(id) && Some(id.clone()) != converted.as_ref()).cloned().collect();
-            for ship_id in ship_ids {
-                let ship = &game.ships[&ship_id];
-                let cargo_space = game.constants.max_halite - ship.halite;
-
-                if cargo_space < min_space {
-                    returning.insert(ship_id, nearest_dropoff(ship.position));
-                    continue
-                }
-
-                let paths_ship = dijkstra_all(&ship.position, |pos| {
-                    let cost = map.at_position(pos).halite / game.constants.move_cost_ratio;
-                    let dist = map.calculate_distance(pos, &ship.position);
-                    pos.get_surrounding_cardinals()
-                        .into_iter()
-                        .filter(move |p| map.calculate_distance(p, &ship.position) > dist)
-                        .map(move |p| (map.normalize(&p), cost))
-                });
-
-                let mut candidates: Vec<_> = paths_dropoff.iter().map(|(&pos, &cost_home)| {
-                    let cost_to = paths_ship.get(&pos).map(|p| p.1).unwrap_or(0);
-                    let dist_to = map.calculate_distance(&ship.position, &pos) + 1;
-                    let dist_home = map.calculate_distance(&pos, &nearest_dropoff(pos)) + 1;
-
-                    // let halite = map.at_position(&pos).halite / game.constants.extract_ratio;
-                    let halite = map.at_position(&pos).halite;
-
-                    let value = (halite as i32 - cost_to as i32).min(cargo_space as i32) / dist_to as i32;
-                    let value_exp = (richness[&pos] as i32 / r_count as i32).min(cargo_space as i32 - value) / (dist_to as i32 + kernel_size as i32);
-                    let value_home = (halite as i32 - cost_home as i32) / (dist_to as i32 + dist_home as i32);
-
-                    // let rate = value + value_exp;
-                    let rate = value + (value_exp * cargo_space as i32 / 1000 + value_home * ship.halite as i32 / 1000);
-                    // let rate =  if cargo_space > richness[&pos] {
-                    //     value + value_exp
-                    // } else {
-                    //     value + value_home
-                    // };
-
-                    (pos, 6, rate)
-                }).collect();
-
-                candidates.sort_unstable_by(|a, b| a.2.cmp(&b.2).reverse());
-
-                if let Some(best) = candidates.iter().find(|(p, _, _)| !mining.contains_key(p)) {
-                    mining.insert(best.0, (ship_id, best.1));
-                } else {
-                    Log::warn("Could not find target");
-                } 
-            }
-
-            // Move towards target (or mine if already on it)
-            for (position, (ship_id, count)) in mining.iter_mut() {
-                continue;
-                // paint target
-                Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
-
-                let ship = &game.ships[ship_id];
-                let cell = map.at_entity(ship);
-
-                // If we are at mining location
-                if &ship.position == position {
-                    Log::log(ship.position, format!("_m{}_", count), purple);
-                    command_queue.push(ship.stay_still());
-                    *count -= 1;
-
-                // Cant afford to move
-                } else if cell.halite / game.constants.move_cost_ratio > ship.halite {
-                    Log::log(ship.position, "_fuel_", orange);
-                    command_queue.push(ship.stay_still());
-
-                // We have enough halite to move
-                } else {
-                    navi.naive_navigate(ship, position, map);
-                }
-            }
-
-            {
-                let start_time = SystemTime::now();
-                for &ship_id in me.ship_ids.iter() {
-                    let mut states = RefCell::new(HashMap::new());
-
-                    let ship = &game.ships[&ship_id];
-                    let start = (ship.position, 0, 0);
-                    let local_key = (ship.position, 0);
-                    states.borrow_mut().insert(local_key, (State::from(&game).with_ship(&ship), 0));
-
-                    let path = astar(
-                        &start,
-                        |&key| {
-                            let local_key = (key.0, key.1);
-                            let (successors, value): (Vec<_>, i32) = {
-                                let (state, value) = &states.borrow()[&local_key];
-                                let mut actions = state.actions(ship_id);
-
-                                (actions.into_iter().map(|action| state.apply(action)).collect(), *value)
-                            };
-
-                            let res: Vec<_> = successors.into_iter()
-                                .filter_map(|(state, cost)| {
-                                    let new_val = value + cost;
-                                    let key = (state.ship(ship_id).0, key.1 + 1, new_val);
-                                    let local_key = (key.0, key.1);
-                                    if states.borrow().contains_key(&local_key) {
-                                        let mut old_state = states.borrow_mut();
-                                        let prev = old_state.get_mut(&local_key).unwrap();
-                                        if new_val < prev.1 {
-                                            *prev = (state, new_val);
-                                            Some((key, Cost(1, cost)))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        states.borrow_mut().insert(local_key, (state, new_val));
-                                        Some((key, Cost(1, cost)))
-                                    }
-                                }).collect();
-
-                            res
-                        },
-                        |&(pos, t, _)| {
-                            let state = &states.borrow()[&(pos, t)].0;
-                            let (pos, hal) = state.ship(ship_id);
-                            let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
-
-                            Cost(dist, state.max_halite as i32 - hal as i32)
-                        },
-                        |&(pos, t, _)| {
-                            let state = &states.borrow()[&(pos, t)].0;
-                            let (pos, hal) = state.ship(ship_id);
-                            let turn_limit = max_lookahead.min(state.turns_remaining());
-                            t >= turn_limit || (hal > 950 && dropoffs.contains(&pos))
-                        }
-                    );
-
-                    let duration = SystemTime::now().duration_since(start_time).expect("Time goes forwards");
-                    Log::info(format!("Time: {:?}", duration));
-
-                    if let Some((path, _)) = path {
-                        if let Some(&(pos, t, _)) = path.get(1) {
-                            let state = &states.borrow()[&(pos, t)].0;
-                            command_queue.push(Command::move_ship(ship_id, state.get_dir(ship.position, pos)));
-                        }
-                        for (pos, t, hal) in path {
-                            Log::log(pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
+                        if action.dir == Direction::Still {
+                            let (pos, _) = state.ship(action.ship_id);
+                            mined.insert(pos, i);
                         }
                     } else {
-                        Log::warn(format!("No path found for ship {}", ship_id.0));
+                        poisoned.insert(action.ship_id, i);
                     }
                 }
-
-                // for (&target, &(ship_id, _)) in mining.iter() {
-                //     let mut states = HashMap::new();
-                //
-                //     let ship = &game.ships[&ship_id];
-                //     let start = (ship.position, 0);
-                //     states.insert(start, State::from(&game).with_ship(&ship));
-                //
-                //     let path = astar(
-                //         &start,
-                //         |&key| {
-                //             let successors: Vec<_> = {
-                //                 let state = &states[&key];
-                //                 let mut actions = state.actions(ship_id);
-                //                 // if actions.is_empty() {
-                //                     actions.push(Action { ship_id, dir: Direction::Still });
-                //                 // }
-                //
-                //                 actions.into_iter().map(|action| state.apply(action)).collect()
-                //             };
-                //
-                //             let res: Vec<_> = successors.into_iter()
-                //                 .map(|(state, value)| {
-                //                     let key = (state.ship(ship_id).0, key.1 + 1);
-                //                     states.insert(key, state);
-                //                     (key, Cost(1, value))
-                //                 }).collect();
-                //
-                //             res
-                //         },
-                //         |key| Cost(map.calculate_distance(&key.0, &target), 0),
-                //         |&(pos, _)| pos == target
-                //     );
-                //
-                //     if let Some((path, _)) = path {
-                //         for (pos, t) in path {
-                //             Log::log(pos, format!("-ship[{}:t{}]-", ship_id.0, t), yellow);
-                //         }
-                //     } else {
-                //         Log::warn(format!("No path found from ship {} to ({}, {})", ship_id.0, target.x, target.y));
-                //     }
-                // }
             }
         }
 
-        for (ship_id, position) in returning.iter() {
-            continue;
-            // paint target
-            Log::log(position.clone(), format!("_t{:?}_", ship_id.0), teal);
-
-            let ship = &game.ships[ship_id];
-            let cell = map.at_entity(ship);
-
-            if &ship.position == position {
-                Log::warn("Already at shipyard, should have set a new target by this point");
-
-            // Cant afford to move
-            } else if cell.halite / game.constants.move_cost_ratio > ship.halite {
-                Log::log(ship.position, "_fuel_", orange);
-                command_queue.push(ship.stay_still());
-
-            // We have enough halite to move
+        for (ship_id, t) in poisoned {
+            if t == 0 {
+                paths.remove(&ship_id);
             } else {
-                navi.naive_navigate(ship, position, map);
+                paths.get_mut(&ship_id).unwrap().truncate(t);
             }
         }
 
-        for (ship_id, dir) in navi.collect_moves() {
-            continue;
-            Log::log(game.ships[&ship_id].position, format!("_{}_", dir.get_char_encoding()), green);
+        for edge in timeline.windows(2) {
+            let prev = &edge[0];
+            let next = &edge[1];
+
+            let diff = prev.diff(next);
+            diffs.push(diff);
+        }
+
+        for &ship_id in ship_ids.iter() {
+            if paths.contains_key(&ship_id) {
+                continue;
+            }
+
+            let mut states = RefCell::new(HashMap::new());
+
+            let ship = &game.ships[&ship_id];
+            let target = (game.constants.max_halite - ship.halite) as i32;
+            let start = (ship.position, 0, 0);
+            let local_key = (ship.position, 0);
+            let state = timeline.first().unwrap().with_ship(&ship);
+
+            states.borrow_mut().insert(local_key, (state, 0));
+
+            let path = astar(
+                &start,
+                |&key| {
+                    let local_key = (key.0, key.1);
+                    let (successors, value): (Vec<_>, i32) = {
+                        let (state, value) = &states.borrow()[&local_key];
+
+                        let diff = &diffs[key.1];
+                        let state = state.merge(&diff);
+
+                        let actions = if key.1 < max_lookahead {
+                            state.actions(ship_id)
+                                .into_iter()
+                                .filter(|action| {
+                                    action.dir != Direction::Still || mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true)
+                                })
+                                .map(|action| state.apply(action))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        (actions, *value)
+                    };
+
+                    let res: Vec<_> = successors.into_iter()
+                        .filter_map(|(state, cost)| {
+                            let new_val = value + cost;
+                            let key = (state.ship(ship_id).0, key.1 + 1, new_val);
+                            let local_key = (key.0, key.1);
+                            if states.borrow().contains_key(&local_key) {
+                                let mut old_state = states.borrow_mut();
+                                let prev = old_state.get_mut(&local_key).unwrap();
+                                if new_val < prev.1 {
+                                    *prev = (state, new_val);
+                                    Some((key, Cost(1, cost)))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                states.borrow_mut().insert(local_key, (state, new_val));
+                                Some((key, Cost(1, cost)))
+                            }
+                        }).collect();
+
+                    res
+                },
+                |&(pos, t, hal)| {
+                    let state = &states.borrow()[&(pos, t)].0;
+                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+
+                    Cost(dist, target + hal)
+                },
+                |&(pos, t, hal)| {
+                    let state = &states.borrow()[&(pos, t)].0;
+                    let turn_limit = max_lookahead.min(state.turns_remaining());
+                    (t >= turn_limit || target + hal < 50) && state.dropoffs.contains(&pos)
+                }
+            );
+
+            let mut states = states.into_inner();
+            if let Some((path, _)) = path {
+                let mut dir_path = VecDeque::new();
+
+                let state = states.remove(&(path[0].0, 0)).unwrap().0;
+                timeline[0] = state;
+
+                for (i, edge) in path.windows(2).enumerate() {
+                    let prev = edge[0];
+                    let next = edge[1];
+
+                    let prev_state = &timeline[i];
+                    let state = states.remove(&(next.0, next.1)).unwrap().0;
+                    let diff = prev_state.diff(&state);
+
+                    // How is timeline extended ?
+                    timeline[i + 1] 
+                }
+
+                // let mut prev = path[0].0;
+                // for &(pos, t, hal) in path[1..].iter() {
+                //     let state = &states.borrow()[&(pos, t)].0;
+                //     let dir = state.get_dir(prev, pos);
+                //     prev = pos;
+                //
+                //     dir_path.push_back(dir);
+                //     Log::log(pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
+                // }
+
+                if !dir_path.is_empty() {
+                    paths.insert(ship_id, dir_path);
+                }
+            } else {
+                Log::warn(format!("No path found for ship {}", ship_id.0));
+            }
+        }
+
+        for (&ship_id, path) in paths.iter_mut() {
+            let dir = path.pop_front().expect("Empty path");
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
         if early_game && 
-            me.halite >= game.constants.ship_cost + used_halite &&
+            me.halite >= game.constants.ship_cost &&
                 navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
         {
             command_queue.push(me.shipyard.spawn());
         }
+
+        let duration = SystemTime::now().duration_since(start_time).expect("Time goes forwards");
+        Log::info(format!("Time: {:?}", duration));
 
         game.end_turn(&command_queue);
     }
