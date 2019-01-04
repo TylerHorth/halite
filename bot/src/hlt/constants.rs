@@ -2,6 +2,7 @@ use hlt::log::Log;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+#[derive(Copy, Clone)]
 pub struct Constants {
     pub max_halite: usize,
     pub ship_cost: usize,

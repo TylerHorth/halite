@@ -4,15 +4,13 @@ extern crate pathfinding;
 extern crate im_rc;
 
 use im_rc as im;
-use std::iter;
 use std::cell::RefCell;
 use std::time::SystemTime;
+use std::time::Duration;
 use hlt::*;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::collections::BinaryHeap;
 use pathfinding::directed::astar::astar;
 use pathfinding::num_traits::identities::Zero;
 
@@ -35,7 +33,9 @@ struct MergedAction {
     ship_id: ShipId,
     pos: Position,
     halite: usize,
-    mined: im::HashMap<Position, usize>
+    returned: usize,
+    mined: im::HashMap<Position, usize>,
+    cost: i32,
 }
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
@@ -59,28 +59,18 @@ impl Zero for Cost {
     }
 }
 
-// Ship halite not tracked (not important)
-struct Diff {
-    map: Vec<(Position, i32)>,
-    ships: Vec<(ShipId, Position, Position)>,
-    dropoffs: Vec<Position>,
-    halite: i32,
-    turn: i32,
-}
-
 struct State {
     map: im::HashMap<Position, usize>,
     ships: im::HashMap<ShipId, (Position, usize)>,
     taken: im::HashMap<Position, ShipId>,
+    enemies: im::HashSet<Position>,
     dropoffs: im::HashSet<Position>,
     halite: usize,
     width: usize,
     height: usize,
     turn: usize,
-    max_turns: usize,
-    max_halite: usize,
-    extract_ratio: usize,
-    move_cost_ratio: usize,
+    start: usize,
+    constants: Constants,
 }
 
 impl State {
@@ -95,6 +85,13 @@ impl State {
         let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
         let halite = me.halite;
 
+        let mut enemies = im::HashSet::new();
+        for ship in game.ships.values() {
+            if ship.owner != game.my_id {
+                enemies.insert(ship.position);
+            }
+        }
+
         let dropoffs: im::HashSet<Position> = std::iter::once(me.shipyard.position)
             .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
             .collect();
@@ -102,25 +99,22 @@ impl State {
         let width = game.map.width;
         let height = game.map.height;
         let turn = game.turn_number;
+        let start = turn;
 
-        let max_turns = game.constants.max_turns;
-        let max_halite = game.constants.max_halite;
-        let extract_ratio = game.constants.extract_ratio;
-        let move_cost_ratio = game.constants.move_cost_ratio;
+        let constants = game.constants.clone();
         
         State {
             map,
             ships,
             taken,
+            enemies,
             dropoffs,
             halite,
             width,
             height,
             turn,
-            max_turns,
-            max_halite,
-            extract_ratio,
-            move_cost_ratio,
+            start,
+            constants,
         }
     }
 
@@ -163,13 +157,11 @@ impl State {
 
     fn update_ship(&mut self, ship_id: ShipId, pos: Position, hal: usize) {
         let ship = self.ships.get_mut(&ship_id).expect(&format!("No ship with id {}", ship_id.0));
-        self.taken.remove(&ship.0);
+        if self.taken.get(&ship.0) == Some(&ship_id) {
+            self.taken.remove(&ship.0);
+        }
         self.taken.insert(pos, ship_id);
         *ship = (pos, hal);
-    }
-
-    fn at_dropoff(&self, ship_id: ShipId) -> bool {
-        self.dropoffs.contains(&self.ship(ship_id).0)
     }
 
     pub fn get_dir(&self, source: Position, destination: Position) -> Direction {
@@ -217,78 +209,125 @@ impl State {
         panic!("This should never happen");
     }
 
-    fn move_ship(&mut self, ship_id: ShipId, dir: Direction) -> i32 {
+    fn move_ship(&mut self, ship_id: ShipId, dir: Direction) {
         assert!(dir != Direction::Still, "Staying still is not a move");
 
         let ship = self.ship(ship_id);
-        let cost = self.halite(ship.0) / self.move_cost_ratio;
+        let cost = self.halite(ship.0) / self.constants.move_cost_ratio;
         let new_pos = self.normalize(ship.0.directional_offset(dir));
         let after_move = ship.1.checked_sub(cost).expect("Not enough halite to move");
 
-        let (new_hal, val) = if self.dropoffs.contains(&new_pos) {
+        let new_hal = if self.dropoffs.contains(&new_pos) {
             self.halite += after_move;
-            (0, cost as i32)
+            0
         } else {
-            (after_move, cost as i32)
+            after_move
         };
 
         self.update_ship(ship_id, new_pos, new_hal);
-
-        val
     }
 
-    fn mine_ship(&mut self, ship_id: ShipId) -> i32 {
+    fn mine_ship(&mut self, ship_id: ShipId) {
         let ship = self.ship(ship_id);
         let pos = ship.0;
         let hal = self.halite(pos);
-        let cap = self.max_halite - ship.1;
-        let mined = div_ceil(hal, self.extract_ratio).min(cap);
+        let cap = self.constants.max_halite - ship.1;
+        let mined = div_ceil(hal, self.constants.extract_ratio).min(cap);
 
         self.update_hal(pos, hal - mined);
         self.update_ship(ship_id, pos, ship.1 + mined);
-
-        mined as i32 * -1
     }
 
     pub fn turns_remaining(&self) -> usize {
-        self.max_turns - self.turn
+        self.constants.max_turns - self.turn
     }
 
-    pub fn actions(&self, ship_id: ShipId) -> Vec<Action> {
-        let (position, halite) = self.ships[&ship_id];
+    pub fn apply_merged_mut(&mut self, merged: &MergedAction) {
+        if !self.taken.contains_key(&merged.pos) {
+            self.taken.insert(merged.pos, merged.ship_id);
+        } 
+        self.ships.insert(merged.ship_id, (merged.pos, merged.halite));
 
-        let cost = self.map[&position] / self.move_cost_ratio;
+        self.halite += merged.returned;
+
+        for &(pos, hal) in &merged.mined {
+            self.map[&pos] = hal;
+        }
+    }
+
+    pub fn apply_merged(&self, merged: &MergedAction) -> State {
+        let mut state = self.clone();
+        state.apply_merged_mut(merged);
+        state
+    }
+
+    pub fn actions(&self, merged: &MergedAction, allow_mine: bool) -> Vec<MergedAction> {
+        let state = self.apply_merged(merged);
+
+        let ship_id = merged.ship_id;
+        let position = merged.pos;
+        let halite = merged.halite;
+
+        let cost = state.map[&position] / state.constants.move_cost_ratio;
         let mut actions = Vec::new();
 
-        if self.turns_remaining() > 0 {
+        if state.turns_remaining() > 0 {
             if halite >= cost {
-                Direction::get_all_cardinals()
-                    .into_iter()
-                    .filter_map(|dir| {
-                        let new_pos = self.normalize(position.directional_offset(dir));
-                        if !self.taken.contains_key(&new_pos) {
-                            Some(Action::new(ship_id, dir))
-                        } else { 
-                            None 
+                for dir in Direction::get_all_cardinals() {
+                    let new_pos = state.normalize(position.directional_offset(dir));
+                    if !state.enemies.contains(&new_pos) || state.dropoffs.contains(&new_pos) {
+                        if state.taken.contains_key(&new_pos) {
+                            if state.dropoffs.contains(&new_pos) {
+                                let mut action = merged.clone();
+
+                                action.pos = new_pos;
+                                action.halite = 0;
+                                action.cost += 2 * state.constants.ship_cost as i32;
+
+                                actions.push(action);
+                            }
+                        } else {
+                            let mut action = merged.clone();
+
+                            let hal_after = action.halite - cost;
+                            let new_hal = if state.dropoffs.contains(&new_pos) {
+                                action.returned += hal_after;
+                                0
+                            } else {
+                                hal_after
+                            };
+
+                            action.pos = new_pos;
+                            action.halite = new_hal;
+                            action.cost += cost as i32;
+
+                            actions.push(action);
                         }
-                    }).for_each(|action| actions.push(action));
+                    }                    
+                }
             } 
 
-            if self.taken[&position] == ship_id {
-                actions.push(Action::new(ship_id, Direction::Still))
+            if allow_mine && state.taken[&position] == ship_id && (!state.enemies.contains(&position) || state.dropoffs.contains(&position)) {
+                let hal = state.halite(position);
+                let cap = state.constants.max_halite - halite;
+                let mined = div_ceil(hal, state.constants.extract_ratio).min(cap);
+                let hal_after = hal - mined;
+
+                let mut action = merged.clone();
+                action.halite += mined;
+
+                if action.mined.contains_key(&position) {
+                    action.mined[&position] = hal_after;
+                } else {
+                    action.mined.insert(position, hal_after);
+                }
+
+                action.cost -= mined as i32;
+                actions.push(action);
             }
         }
 
         actions
-    }
-
-    pub fn with_ship(&self, ship: &Ship) -> State {
-        let mut state = self.clone();
-
-        state.ships.insert(ship.id, (ship.position, ship.halite));
-        state.taken.insert(ship.position, ship.id);
-
-        state
     }
 
     pub fn add_ship(&mut self, ship: &Ship) {
@@ -301,105 +340,41 @@ impl State {
         self.taken.remove(&position);
     }
 
-    pub fn diff(&self, other: &State) -> Diff {
-        let mut map = Vec::new();
-        for &(pos, val) in self.map.iter() {
-            let diff = other.halite(pos) as i32 - val as i32;
-            if diff != 0 {
-                map.push((pos, diff));
-            }
-        }
-
-        let mut ships = Vec::new();
-        for &(ship_id, (pos, _)) in self.ships.iter() {
-            let other_pos = other.ship(ship_id).0;
-            if other_pos != pos {
-                ships.push((ship_id, pos, other_pos));
-            }
-        }
-
-        let mut dropoffs = Vec::new();
-        for &dropoff_pos in other.dropoffs.iter() {
-            if !self.dropoffs.contains(&dropoff_pos) {
-                dropoffs.push(dropoff_pos);
-            }
-        }
-
-        let halite = other.halite as i32 - self.halite as i32;
-        let turn = other.turn as i32 - self.turn as i32;
-
-        Diff {
-            map: map,
-            ships: ships,
-            dropoffs: dropoffs,
-            halite: halite,
-            turn: turn,
-        }
-    }
-
-    pub fn merge(&self, diff: &Diff) -> State {
-        let mut state = self.clone();
-
-        for &(pos, hal) in &diff.map {
-            if hal > 0 {
-                state.map[&pos] += hal as usize;
-            } else {
-                state.map[&pos] -= -hal as usize;
-            }
-        }
-
-        for &(ship_id, old_pos, new_pos) in &diff.ships {
-            state.ships[&ship_id].0 = new_pos;
-            state.taken.remove(&old_pos);
-            state.taken.insert(new_pos, ship_id);
-        }
-
-        for &dropoff_pos in &diff.dropoffs {
-            state.dropoffs.insert(dropoff_pos);
-        }
-
-        if diff.halite > 0 {
-            state.halite += diff.halite as usize;
-        } else {
-            state.halite -= -diff.halite as usize;
-        }
-
-        if diff.turn > 0 {
-            state.turn += diff.turn as usize;
-        } else {
-            state.turn -= -diff.turn as usize;
-        }
-
-        state
-    }
-
     pub fn next(&self) -> State {
         let mut state = self.clone();
         state.turn += 1;
+
+        match state.turn - state.start {
+            1 => {
+                for &enemy in &self.enemies {
+                    Log::color(enemy, "#770000");
+                    for dir in Direction::get_all_cardinals() {
+                        let new_pos = self.normalize(enemy.directional_offset(dir));
+                        Log::color(new_pos, "#330000");
+                        state.enemies.insert(new_pos);
+                    }
+                }
+            },
+            // _ => state.enemies.clear()
+            _ => {}
+        };
 
         state
     }
 
     pub fn can_apply(&self, action: Action) -> bool {
+        let (pos, hal) = self.ship(action.ship_id);
         match action.dir {
-            Direction::Still => true,
+            Direction::Still => !self.enemies.contains(&pos) || self.dropoffs.contains(&pos),
             _ => {
-                let (pos, hal) = self.ship(action.ship_id);
-                let cost = self.map[&pos] / self.move_cost_ratio;
-                hal >= cost
+                let cost = self.map[&pos] / self.constants.move_cost_ratio;
+                let new_pos = self.normalize(pos.directional_offset(action.dir));
+                hal >= cost && !self.enemies.contains(&new_pos)
             }
         }
     }
 
-    pub fn apply(&self, action: Action) -> (State, i32) {
-        let mut state = self.next();
-
-        let value = state.apply_mut(action);
-
-        (state, value)
-    }
-
-    pub fn apply_mut(&mut self, action: Action) -> i32 {
+    pub fn apply(&mut self, action: Action) {
         match action.dir {
             Direction::Still => self.mine_ship(action.ship_id),
             dir => self.move_ship(action.ship_id, dir),
@@ -413,6 +388,7 @@ impl Clone for State {
             map: self.map.clone(),
             ships: self.ships.clone(),
             taken: self.taken.clone(),
+            enemies: self.enemies.clone(),
             dropoffs: self.dropoffs.clone(),
             ..*self
         }
@@ -429,20 +405,22 @@ fn main() {
     let mut navi = Navi::new(game.map.width, game.map.height);
 
     // Constants
-    let max_lookahead = 100;
+    let max_lookahead = 30;
 
     // Colors
-    let red = "#FF0000";
-    let purple = "#9d00ff";
-    let orange = "#ff8800";
-    let green = "#00ff48";
-    let teal = "#42f4ee";
+    // let red = "#FF0000";
+    // let purple = "#9d00ff";
+    // let orange = "#ff8800";
+    // let green = "#00ff48";
+    // let teal = "#42f4ee";
     let yellow = "#FFFF00";
 
     let total_halite: usize = game.map.iter().map(|cell| cell.halite).sum();
 
     // State
     let mut paths: HashMap<ShipId, VecDeque<Direction>> = HashMap::new();
+    let mut runtime = Duration::default();
+    let mut max = (Duration::default(), 0);
 
     Game::ready("downside");
 
@@ -457,8 +435,7 @@ fn main() {
         let mut command_queue: Vec<Command> = Vec::new();
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
-        // let turn_limit = game.constants.max_turns * 2 / 3;
-        let turn_limit = 2; //game.constants.max_turns * 2 / 3;
+        let turn_limit = game.constants.max_turns * 2 / 3;
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
 
         let ship_ids: HashSet<ShipId> = me.ship_ids.iter().cloned().collect();
@@ -481,30 +458,56 @@ fn main() {
             }
         }
 
-        let mut timeline: Vec<State> = vec![state];
-        let mut diffs: Vec<Diff> = Vec::new();
+        let timeline: RefCell<Vec<State>> = RefCell::new(vec![state]);
         let mut poisoned: HashMap<ShipId, usize> = HashMap::new();
         let mut mined: HashMap<Position, usize> = HashMap::new();
 
+        let mut seen_last: HashSet<ShipId> = HashSet::new(); 
+        let mut rm_next: Vec<ShipId> = Vec::new(); 
         for (i, step) in actions.into_iter().enumerate() {
-            let state = timeline[i].next();
-            timeline.push(state);
+            let mut timeline = timeline.borrow_mut();
+            let mut state = timeline[i].next();
 
-            let state = timeline.last_mut().unwrap();
+            for ship_id in rm_next.drain(..) {
+                state.rm_ship(ship_id);
+            }
+
+            let mut seen = HashSet::new();
             for action in step {
                 if !poisoned.contains_key(&action.ship_id) {
                     if state.can_apply(action) {
-                        state.apply_mut(action);
+                        state.apply(action);
+                        seen.insert(action.ship_id);
 
                         if action.dir == Direction::Still {
                             let (pos, _) = state.ship(action.ship_id);
                             mined.insert(pos, i);
                         }
                     } else {
+                        Log::warn(format!("P(s:{},t:{})", action.ship_id.0, i));
                         poisoned.insert(action.ship_id, i);
                     }
                 }
             }
+
+            for &ship_id in &seen_last {
+                if !seen.contains(&ship_id) {
+                    rm_next.push(ship_id);
+                }
+            }
+
+            seen_last = seen;
+            timeline.push(state);
+        }
+
+        {
+            let mut timeline = timeline.borrow_mut();
+            let mut state = timeline.last().unwrap().next();
+
+            state.taken.clear();
+            state.ships.clear();
+
+            timeline.push(state);
         }
 
         for (ship_id, t) in poisoned {
@@ -515,123 +518,140 @@ fn main() {
             }
         }
 
-        for edge in timeline.windows(2) {
-            let prev = &edge[0];
-            let next = &edge[1];
+        let mut initial_actions: Vec<(MergedAction, ShipId, usize)> = ship_ids
+            .into_iter()
+            .filter(|ship_id| !paths.contains_key(ship_id))
+            .map(|ship_id| {
+                let ship = &game.ships[&ship_id];
+                let action = MergedAction {
+                    ship_id,
+                    pos: ship.position,
+                    halite: ship.halite,
+                    returned: 0,
+                    mined: im::HashMap::new(),
+                    cost: 0,
+                };
 
-            let diff = prev.diff(next);
-            diffs.push(diff);
-        }
+                let mut timeline = timeline.borrow_mut();
+                if timeline.len() == 1 {
+                    let next = timeline.last().unwrap().next();
+                    timeline.push(next);
+                }
 
-        for &ship_id in ship_ids.iter() {
+                let state = &timeline[1];
+                let num_turns = state.actions(&action, true).len();
+
+                (action, ship_id, num_turns)
+            }).collect();
+
+        initial_actions.sort_by_key(|(_, ship_id, num_turns)| (*num_turns, ship_id.0));
+
+        for (action, ship_id, _) in initial_actions {
             if paths.contains_key(&ship_id) {
                 continue;
             }
 
-            let mut states = RefCell::new(HashMap::new());
+            Log::info(format!("s:{},", ship_id.0));
 
             let ship = &game.ships[&ship_id];
             let target = (game.constants.max_halite - ship.halite) as i32;
-            let start = (ship.position, 0, 0);
-            let local_key = (ship.position, 0);
-            let state = timeline.first().unwrap().with_ship(&ship);
 
-            states.borrow_mut().insert(local_key, (state, 0));
+            let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
+
+            merged.borrow_mut().insert((ship.position, 0), action);
 
             let path = astar(
-                &start,
+                &(ship.position, 0, 0),
                 |&key| {
+                    let mut timeline = timeline.borrow_mut();
+
                     let local_key = (key.0, key.1);
-                    let (successors, value): (Vec<_>, i32) = {
-                        let (state, value) = &states.borrow()[&local_key];
+                    let successors: Vec<MergedAction> = {
+                        let parent = &merged.borrow()[&local_key];
+                        if key.1 + 1 == timeline.len() {
+                            let next = timeline.last().unwrap().next();
+                            timeline.push(next);
+                        }
 
-                        let diff = &diffs[key.1];
-                        let state = state.merge(&diff);
+                        let state = &timeline[key.1 + 1];
 
-                        let actions = if key.1 < max_lookahead {
-                            state.actions(ship_id)
-                                .into_iter()
-                                .filter(|action| {
-                                    action.dir != Direction::Still || mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true)
-                                })
-                                .map(|action| state.apply(action))
-                                .collect()
+                        if key.1 < max_lookahead {
+                            let allow_mine = mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true) || state.dropoffs.contains(&key.0);
+                            state.actions(parent, allow_mine)
                         } else {
                             Vec::new()
-                        };
-
-                        (actions, *value)
+                        }
                     };
 
                     let res: Vec<_> = successors.into_iter()
-                        .filter_map(|(state, cost)| {
-                            let new_val = value + cost;
-                            let key = (state.ship(ship_id).0, key.1 + 1, new_val);
+                        .filter_map(|action| {
+                            let mut merged = merged.borrow_mut();
+                            let parent_cost = merged[&local_key].cost;
+
+                            let key = (action.pos, key.1 + 1, action.cost);
                             let local_key = (key.0, key.1);
-                            if states.borrow().contains_key(&local_key) {
-                                let mut old_state = states.borrow_mut();
-                                let prev = old_state.get_mut(&local_key).unwrap();
-                                if new_val < prev.1 {
-                                    *prev = (state, new_val);
-                                    Some((key, Cost(1, cost)))
+                            let marginal_cost = action.cost - parent_cost;
+
+                            if merged.contains_key(&local_key) {
+                                let prev = merged.get_mut(&local_key).unwrap();
+                                if action.cost < prev.cost {
+                                    *prev = action;
+                                    Some((key, Cost(1, marginal_cost)))
                                 } else {
                                     None
                                 }
                             } else {
-                                states.borrow_mut().insert(local_key, (state, new_val));
-                                Some((key, Cost(1, cost)))
+                                merged.insert(local_key, action);
+                                Some((key, Cost(1, marginal_cost)))
                             }
                         }).collect();
 
                     res
                 },
                 |&(pos, t, hal)| {
-                    let state = &states.borrow()[&(pos, t)].0;
+                    let state = &timeline.borrow()[t];
                     let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
 
                     Cost(dist, target + hal)
                 },
                 |&(pos, t, hal)| {
-                    let state = &states.borrow()[&(pos, t)].0;
-                    let turn_limit = max_lookahead.min(state.turns_remaining());
-                    (t >= turn_limit || target + hal < 50) && state.dropoffs.contains(&pos)
+                    let state = &timeline.borrow()[t];
+                    let turns_remaining = state.turns_remaining();
+                    let at_dropoff = state.dropoffs.contains(&pos);
+                    let full_halite = target + hal < 50;
+                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+
+                    t + dist >= max_lookahead || ((t >= turns_remaining || full_halite) && at_dropoff)
                 }
             );
 
-            let mut states = states.into_inner();
             if let Some((path, _)) = path {
                 let mut dir_path = VecDeque::new();
+                let mut timeline = timeline.borrow_mut();
+                let merged = merged.borrow();
 
-                let state = states.remove(&(path[0].0, 0)).unwrap().0;
-                timeline[0] = state;
-
-                for (i, edge) in path.windows(2).enumerate() {
-                    let prev = edge[0];
-                    let next = edge[1];
-
-                    let prev_state = &timeline[i];
-                    let state = states.remove(&(next.0, next.1)).unwrap().0;
-                    let diff = prev_state.diff(&state);
-
-                    // How is timeline extended ?
-                    timeline[i + 1] 
+                for &(pos, t, _) in &path {
+                    let diff = &merged[&(pos, t)];
+                    timeline[t].apply_merged_mut(diff);
                 }
 
-                // let mut prev = path[0].0;
-                // for &(pos, t, hal) in path[1..].iter() {
-                //     let state = &states.borrow()[&(pos, t)].0;
-                //     let dir = state.get_dir(prev, pos);
-                //     prev = pos;
-                //
-                //     dir_path.push_back(dir);
-                //     Log::log(pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
-                // }
+                for edge in path.windows(2) {
+                    let prev = edge[0].0;
+                    let (next, t, hal) = edge[1];
+
+                    let dir = timeline[0].get_dir(prev, next);
+
+                    dir_path.push_back(dir);
+                    Log::log(next, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
+                }
 
                 if !dir_path.is_empty() {
                     paths.insert(ship_id, dir_path);
-                }
+                } 
             } else {
-                Log::warn(format!("No path found for ship {}", ship_id.0));
+                Log::error(format!("No path found for ship {}", ship_id.0));
+                paths.insert(ship_id, VecDeque::from(vec![Direction::Still]));
+                timeline.borrow_mut().get_mut(1).map(|state| state.add_ship(ship));
             }
         }
 
@@ -640,15 +660,20 @@ fn main() {
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
-        if early_game && 
-            me.halite >= game.constants.ship_cost &&
-                navi.get(&me.shipyard.position).map_or(true, |ship| game.ships[&ship].owner != game.my_id)
-        {
+        let can_afford_ship = me.halite >= game.constants.ship_cost;
+        let is_safe = timeline.borrow().get(1).map(|state| !state.taken.contains_key(&me.shipyard.position)).unwrap_or(true);
+        if early_game && can_afford_ship && is_safe {
             command_queue.push(me.shipyard.spawn());
         }
 
         let duration = SystemTime::now().duration_since(start_time).expect("Time goes forwards");
-        Log::info(format!("Time: {:?}", duration));
+
+        runtime += duration;
+        max = max.max((duration, game.turn_number));
+
+        let mean = runtime / game.turn_number as u32;
+
+        Log::info(format!("Time: {:?}, mean: {:?}, max: {:?}, total: {:?}, look-ahead: {}", duration, mean, max, runtime, max_lookahead));
 
         game.end_turn(&command_queue);
     }

@@ -122,26 +122,30 @@ impl Log {
         Log::turn(turn_num);
     }
 
-    pub fn flash(message: impl Into<String>, color: impl Into<String>) {
+    pub fn flash(message: impl Into<String>, color: impl Into<String>, level: i32) {
         let log = LOG.lock().unwrap();
         let turn_num = log.turn;
         drop(log);
 
-        let zero_pos = Position { x: 0, y: 0 };
+        let zero_pos = Position { x: 0, y: level };
         Log::log(zero_pos, message, color);
         Log::turn(turn_num);
     }
 
     pub fn info(message: impl Into<String>) {
-        Log::flash(message, "#9bc6ff");
+        Log::flash(message, "#9bc6ff", 0);
     }
 
     pub fn warn(message: impl Into<String>) {
-        Log::flash(message, "#ffa500");
+        Log::flash(message, "#ffa500", 1);
+    }
+
+    pub fn error(message: impl Into<String>) {
+        Log::flash(message, "#FF0000", 2);
     }
 
     pub fn panic(message: impl Into<String>) -> ! {
-        Log::flash(message, "#FF0000");
+        Log::error(message);
 
         exit(1)
     }
