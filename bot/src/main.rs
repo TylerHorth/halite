@@ -19,12 +19,13 @@ mod hlt;
 #[derive(Copy, Clone)]
 struct Action {
     ship_id: ShipId,
-    dir: Direction
+    dir: Direction,
+    inspired: bool,
 }
 
 impl Action {
-    pub fn new(ship_id: ShipId, dir: Direction) -> Action {
-        Action { ship_id, dir }
+    pub fn new(ship_id: ShipId, dir: Direction, inspired: bool) -> Action {
+        Action { ship_id, dir, inspired }
     }
 }
 
@@ -34,6 +35,7 @@ struct MergedAction {
     pos: Position,
     halite: usize,
     returned: usize,
+    inspired: bool,
     mined: im::HashMap<Position, usize>,
     cost: i32,
 }
@@ -64,6 +66,7 @@ struct State {
     ships: im::HashMap<ShipId, (Position, usize)>,
     taken: im::HashMap<Position, ShipId>,
     enemies: im::HashSet<Position>,
+    inspired: im::HashSet<Position>,
     dropoffs: im::HashSet<Position>,
     halite: usize,
     width: usize,
@@ -92,6 +95,21 @@ impl State {
             }
         }
 
+        let mut inspired = im::HashSet::new();
+        for pos in game.map.iter().map(|cell| cell.position) {
+            let mut c = 0;
+            for &ship_pos in enemies.iter() {
+                if game.map.calculate_distance(&pos, &ship_pos) <= game.constants.inspiration_radius {
+                    c += 1;
+                }
+
+                if c == game.constants.inspiration_ship_count {
+                    inspired.insert(pos);
+                    break
+                }
+            }
+        }
+
         let dropoffs: im::HashSet<Position> = std::iter::once(me.shipyard.position)
             .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
             .collect();
@@ -108,6 +126,7 @@ impl State {
             ships,
             taken,
             enemies,
+            inspired,
             dropoffs,
             halite,
             width,
@@ -232,7 +251,13 @@ impl State {
         let pos = ship.0;
         let hal = self.halite(pos);
         let cap = self.constants.max_halite - ship.1;
-        let mined = div_ceil(hal, self.constants.extract_ratio).min(cap);
+        let mined = div_ceil(hal, self.constants.extract_ratio);
+        let mined = if self.inspired.contains(&pos) {
+            mined + (mined as f64 * self.constants.inspired_bonus_multiplier) as usize
+        } else {
+            mined
+        };
+        let mined = mined.min(cap);
 
         self.update_hal(pos, hal - mined);
         self.update_ship(ship_id, pos, ship.1 + mined);
@@ -275,6 +300,7 @@ impl State {
             if halite >= cost {
                 for dir in Direction::get_all_cardinals() {
                     let new_pos = state.normalize(position.directional_offset(dir));
+                    let inspired = state.inspired.contains(&new_pos);
                     if !state.enemies.contains(&new_pos) || state.dropoffs.contains(&new_pos) {
                         if state.taken.contains_key(&new_pos) {
                             if state.dropoffs.contains(&new_pos) {
@@ -282,6 +308,7 @@ impl State {
 
                                 action.pos = new_pos;
                                 action.halite = 0;
+                                action.inspired = inspired;
                                 action.cost += 2 * state.constants.ship_cost as i32;
 
                                 actions.push(action);
@@ -299,6 +326,7 @@ impl State {
 
                             action.pos = new_pos;
                             action.halite = new_hal;
+                            action.inspired = inspired;
                             action.cost += cost as i32;
 
                             actions.push(action);
@@ -308,12 +336,23 @@ impl State {
             } 
 
             if allow_mine && state.taken[&position] == ship_id && (!state.enemies.contains(&position) || state.dropoffs.contains(&position)) {
+                let mut action = merged.clone();
+
                 let hal = state.halite(position);
                 let cap = state.constants.max_halite - halite;
-                let mined = div_ceil(hal, state.constants.extract_ratio).min(cap);
+
+                let mined = div_ceil(hal, state.constants.extract_ratio);
+                let mined = if state.inspired.contains(&position) {
+                    action.inspired = true;
+                    mined + (mined as f64 * state.constants.inspired_bonus_multiplier) as usize
+                } else {
+                    action.inspired = false;
+                    mined
+                };
+                let mined = mined.min(cap);
+
                 let hal_after = hal - mined;
 
-                let mut action = merged.clone();
                 action.halite += mined;
 
                 if action.mined.contains_key(&position) {
@@ -364,11 +403,16 @@ impl State {
 
     pub fn can_apply(&self, action: Action) -> bool {
         let (pos, hal) = self.ship(action.ship_id);
+        let new_pos = self.normalize(pos.directional_offset(action.dir));
+
+        if action.inspired != self.inspired.contains(&new_pos) {
+            return false;
+        }
+
         match action.dir {
             Direction::Still => !self.enemies.contains(&pos) || self.dropoffs.contains(&pos),
             _ => {
                 let cost = self.map[&pos] / self.constants.move_cost_ratio;
-                let new_pos = self.normalize(pos.directional_offset(action.dir));
                 hal >= cost && !self.enemies.contains(&new_pos)
             }
         }
@@ -389,6 +433,7 @@ impl Clone for State {
             ships: self.ships.clone(),
             taken: self.taken.clone(),
             enemies: self.enemies.clone(),
+            inspired: self.inspired.clone(),
             dropoffs: self.dropoffs.clone(),
             ..*self
         }
@@ -405,7 +450,7 @@ fn main() {
     let mut navi = Navi::new(game.map.width, game.map.height);
 
     // Constants
-    let max_lookahead = 30;
+    let max_lookahead = 40;
 
     // Colors
     // let red = "#FF0000";
@@ -418,7 +463,7 @@ fn main() {
     let total_halite: usize = game.map.iter().map(|cell| cell.halite).sum();
 
     // State
-    let mut paths: HashMap<ShipId, VecDeque<Direction>> = HashMap::new();
+    let mut paths: HashMap<ShipId, VecDeque<(Direction, bool)>> = HashMap::new();
     let mut runtime = Duration::default();
     let mut max = (Duration::default(), 0);
 
@@ -449,12 +494,12 @@ fn main() {
 
         let mut actions: Vec<Vec<Action>> = Vec::new();
         for (&ship_id, dirs) in &paths {
-            for (i, &dir) in dirs.iter().enumerate() {
+            for (i, &(dir, inspired)) in dirs.iter().enumerate() {
                 if i >= actions.len() {
                     actions.push(Vec::new());
                 }
 
-                actions[i].push(Action::new(ship_id, dir));
+                actions[i].push(Action::new(ship_id, dir, inspired));
             }
         }
 
@@ -528,6 +573,7 @@ fn main() {
                     pos: ship.position,
                     halite: ship.halite,
                     returned: 0,
+                    inspired: false,
                     mined: im::HashMap::new(),
                     cost: 0,
                 };
@@ -641,7 +687,7 @@ fn main() {
 
                     let dir = timeline[0].get_dir(prev, next);
 
-                    dir_path.push_back(dir);
+                    dir_path.push_back((dir, merged[&(next, t)].inspired));
                     Log::log(next, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), yellow);
                 }
 
@@ -650,13 +696,13 @@ fn main() {
                 } 
             } else {
                 Log::error(format!("No path found for ship {}", ship_id.0));
-                paths.insert(ship_id, VecDeque::from(vec![Direction::Still]));
+                paths.insert(ship_id, VecDeque::from(vec![(Direction::Still, timeline.borrow()[0].inspired.contains(&ship.position))]));
                 timeline.borrow_mut().get_mut(1).map(|state| state.add_ship(ship));
             }
         }
 
         for (&ship_id, path) in paths.iter_mut() {
-            let dir = path.pop_front().expect("Empty path");
+            let dir = path.pop_front().expect("Empty path").0;
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
