@@ -6,7 +6,7 @@ use hlt::PlayerId;
 use hlt::position::Position;
 use hlt::ShipId;
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Ship {
     pub owner: PlayerId,
     pub id: ShipId,
