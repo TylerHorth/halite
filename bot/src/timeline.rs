@@ -9,15 +9,19 @@ use pathfinding::directed::astar::astar;
 use cost::Cost;
 
 const MAX_LOOKAHEAD: usize = 40;
+const MIN_LOOKAHEAD: usize = 8;
+const TARGET_DELTA: i32 = 50;
 
 pub struct Timeline {
     timeline: RefCell<Vec<State>>,
     unpathed: HashMap<ShipId, Ship>,
     mined: HashMap<Position, usize>,
+    spawn_action: MergedAction,
+    constants: Constants,
 }
 
 impl Timeline {
-    pub fn from(game: &Game, paths: &mut HashMap<ShipId, VecDeque<Action>>) -> Timeline {
+    pub fn from(game: &Game, crashed: Vec<Position>, paths: &mut HashMap<ShipId, VecDeque<Action>>) -> Timeline {
         // Prune crashed ships and completed paths
         let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
         let ship_ids: HashSet<ShipId> = me.ship_ids.iter().cloned().collect();
@@ -38,7 +42,7 @@ impl Timeline {
                     actions.push(Vec::new());
                 }
 
-                actions[i].push(Action::new(ship_id, action.dir, action.inspired));
+                actions[i].push(Action::new(ship_id, action.dir, action.inspired, action.risk));
             }
         }
 
@@ -48,6 +52,16 @@ impl Timeline {
         let mut poisoned: HashMap<ShipId, usize> = HashMap::new();
         let mut seen_last: HashSet<ShipId> = HashSet::new(); 
         let mut rm_next: Vec<ShipId> = Vec::new(); 
+
+        // Poison paths that are near a crash
+        for &ship_id in paths.keys() {
+            let pos = timeline[0].ship(ship_id).0;
+            for &crash in &crashed {
+                if timeline[0].calculate_distance(pos, crash) <= 6 {
+                    poisoned.insert(ship_id, 0);
+                }
+            }
+        }
 
         // Create timeline states from sequence of actions
         for (i, step) in actions.into_iter().enumerate() {
@@ -116,10 +130,16 @@ impl Timeline {
             .map(|ship_id| (ship_id, game.ships[&ship_id].clone()))
             .collect();
 
+        // Action to test spawning ships [ship_id = INT_MAX]
+        let spawn_action = MergedAction::spawn(me.shipyard.position);
+        let constants = game.constants.clone();
+
         Timeline {
             timeline: RefCell::new(timeline),
             unpathed,
             mined,
+            spawn_action,
+            constants,
         }
     }
 
@@ -136,6 +156,94 @@ impl Timeline {
         RefMut::map(timeline, |timeline| &mut timeline[t])
     }
 
+    fn path<H, S>(&mut self, initial_action: MergedAction, start: usize, target: i32, inspire: bool, max_lookahead: usize, heuristic: H, success: S) -> Option<Vec<MergedAction>>
+        where S: Fn(bool, bool, bool, bool) -> bool,
+              H: Fn(i32, usize) -> Cost {
+            let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
+            let initial_pos = initial_action.pos;
+
+            merged.borrow_mut().insert((initial_pos, start), initial_action);
+
+            let path = astar(
+                &(initial_pos, start, 0),
+                |&key| {
+                    let local_key = (key.0, key.1);
+                    let successors: Vec<MergedAction> = {
+                        let parent = &merged.borrow()[&local_key];
+                        let state = self.state(key.1 + 1);
+
+                        if key.1 < max_lookahead {
+                            let allow_mine = self.mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true) || state.dropoffs.contains(&key.0);
+                            state.actions(parent, allow_mine, inspire)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+
+                    let res: Vec<_> = successors.into_iter()
+                        .filter_map(|action| {
+                            let mut merged = merged.borrow_mut();
+                            let parent_cost = merged[&local_key].cost;
+
+                            let key = (action.pos, key.1 + 1, action.cost);
+                            let local_key = (key.0, key.1);
+                            let marginal_cost = action.cost - parent_cost;
+
+                            if merged.contains_key(&local_key) {
+                                let prev = merged.get_mut(&local_key).unwrap();
+                                if action.cost < prev.cost {
+                                    *prev = action;
+                                    Some((key, Cost(1, marginal_cost)))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                merged.insert(local_key, action);
+                                Some((key, Cost(1, marginal_cost)))
+                            }
+                        }).collect();
+
+                    res
+                },
+                |&(pos, t, hal)| {
+                    let state = self.state(t);
+                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+
+                    heuristic(hal, dist)
+                },
+                |&(pos, t, hal)| {
+                    let state = self.state(t);
+                    let turns_remaining = state.turns_remaining();
+                    let at_dropoff = state.dropoffs.contains(&pos);
+                    let full_halite = target + hal < TARGET_DELTA;
+                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+
+                    let depth_limit = t + dist >= max_lookahead;
+                    let time_limit = t >= turns_remaining;
+
+                    success(depth_limit, time_limit, full_halite, at_dropoff)
+                }
+            );
+
+            let mut merged = merged.into_inner();
+            path.map(|(path, _)| path.into_iter().map(|(pos, t, _)| merged.remove(&(pos, t)).unwrap()).collect())
+        }
+
+    pub fn spawn_ship(&mut self) -> bool {
+        let spawn_action = self.spawn_action.clone();
+        let taken = self.state(1).taken.contains_key(&spawn_action.pos);
+        let ship_cost = self.constants.ship_cost;
+        let can_afford = self.state(0).halite >= ship_cost;
+
+        let target = self.constants.max_halite as i32;
+        let heuristic = |hal, dist| Cost(dist, target + hal);
+        let success = |depth_limit, time_limit, full_halite, at_dropoff| {
+            depth_limit || ((time_limit || full_halite) && at_dropoff)
+        };
+
+        can_afford && !taken && self.path(spawn_action, 1, target, false, MIN_LOOKAHEAD, heuristic, success).is_some()
+    }
+
     pub fn path_ship(
         &mut self,
         initial_action: MergedAction,
@@ -143,89 +251,28 @@ impl Timeline {
     ) {
         let ship_id = initial_action.ship_id;
         let ship = &self.unpathed.remove(&ship_id).expect(&format!("Ship already pathed {}", ship_id.0));
-        let target = (self.state(0).constants.max_halite - ship.halite) as i32;
+        let target = (self.constants.max_halite - ship.halite) as i32;
+        let heuristic = |hal, dist| Cost(dist, target + hal);
+        let success = |depth_limit, time_limit, full_halite, at_dropoff| {
+            depth_limit || ((time_limit || full_halite) && at_dropoff)
+        };
 
-        let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
-
-        merged.borrow_mut().insert((ship.position, 0), initial_action);
-
-        let path = astar(
-            &(ship.position, 0, 0),
-            |&key| {
-                let local_key = (key.0, key.1);
-                let successors: Vec<MergedAction> = {
-                    let parent = &merged.borrow()[&local_key];
-                    let state = self.state(key.1 + 1);
-
-                    if key.1 < MAX_LOOKAHEAD {
-                        let allow_mine = self.mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true) || state.dropoffs.contains(&key.0);
-                        state.actions(parent, allow_mine)
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                let res: Vec<_> = successors.into_iter()
-                    .filter_map(|action| {
-                        let mut merged = merged.borrow_mut();
-                        let parent_cost = merged[&local_key].cost;
-
-                        let key = (action.pos, key.1 + 1, action.cost);
-                        let local_key = (key.0, key.1);
-                        let marginal_cost = action.cost - parent_cost;
-
-                        if merged.contains_key(&local_key) {
-                            let prev = merged.get_mut(&local_key).unwrap();
-                            if action.cost < prev.cost {
-                                *prev = action;
-                                Some((key, Cost(1, marginal_cost)))
-                            } else {
-                                None
-                            }
-                        } else {
-                            merged.insert(local_key, action);
-                            Some((key, Cost(1, marginal_cost)))
-                        }
-                    }).collect();
-
-                res
-            },
-            |&(pos, t, hal)| {
-                let state = self.state(t);
-                let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
-
-                Cost(dist, target + hal)
-            },
-            |&(pos, t, hal)| {
-                let state = self.state(t);
-                let turns_remaining = state.turns_remaining();
-                let at_dropoff = state.dropoffs.contains(&pos);
-                let full_halite = target + hal < 50;
-                let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
-
-                t + dist >= MAX_LOOKAHEAD || ((t >= turns_remaining || full_halite) && at_dropoff)
-            }
-        );
-
-        if let Some((path, _)) = path {
+        if let Some(path) = self.path(initial_action, 0, target, true, MAX_LOOKAHEAD, heuristic, success) {
             let mut actions = VecDeque::new();
-            let merged = merged.borrow();
 
-            for &(pos, t, _) in &path {
-                let diff = &merged[&(pos, t)];
-                self.state(t).apply_merged_mut(diff);
+            for (i, diff) in path.iter().enumerate() {
+                self.state(i).apply_merged_mut(diff);
             }
 
-            for edge in path.windows(2) {
-                let prev = edge[0].0;
-                let (next, t, hal) = edge[1];
+            for (i, edge) in path.windows(2).enumerate() {
+                let prev = &edge[0];
+                let next = &edge[1];
 
-                let dir = self.state(0).get_dir(prev, next);
-                let inspired = merged[&(next, t)].inspired;
-                let action = Action::new(ship_id, dir, inspired);
+                let dir = self.state(0).get_dir(prev.pos, next.pos);
+                let action = Action::new(next.ship_id, dir, next.inspired, next.risk);
 
                 actions.push_back(action);
-                Log::log(next, format!("-ship[{}:t{}:h{}]-", ship_id.0, t, hal), "yellow");
+                Log::log(next.pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, i, next.halite), "yellow");
             }
 
             if !actions.is_empty() {
@@ -235,7 +282,7 @@ impl Timeline {
             Log::error(format!("No path found for ship {}", ship_id.0));
 
             let inspired = self.state(0).inspired.contains(&ship.position);
-            let action = Action::new(ship_id, Direction::Still, inspired);
+            let action = Action::new(ship_id, Direction::Still, inspired, false);
             paths.insert(ship_id, VecDeque::from(vec![action]));
 
             self.state(1).add_ship(ship);
@@ -249,7 +296,7 @@ impl Timeline {
                 let action = MergedAction::new(ship);
 
                 let state = self.state(1);
-                let num_turns = state.actions(&action, true).len();
+                let num_turns = state.actions(&action, true, true).len();
 
                 (action, num_turns)
             }).collect();

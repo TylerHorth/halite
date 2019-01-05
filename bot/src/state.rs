@@ -6,9 +6,10 @@ pub struct State {
     pub map: im::HashMap<Position, usize>,
     pub ships: im::HashMap<ShipId, (Position, usize)>,
     pub taken: im::HashMap<Position, ShipId>,
-    pub enemies: im::HashSet<Position>,
+    pub enemies: im::HashMap<Position, usize>,
     pub inspired: im::HashSet<Position>,
     pub dropoffs: im::HashSet<Position>,
+    pub num_players: usize,
     pub halite: usize,
     pub width: usize,
     pub height: usize,
@@ -29,17 +30,19 @@ impl State {
         let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
         let halite = me.halite;
 
-        let mut enemies = im::HashSet::new();
+        let mut enemies = im::HashMap::new();
         for ship in game.ships.values() {
             if ship.owner != game.my_id {
-                enemies.insert(ship.position);
+                enemies.insert(ship.position, ship.halite);
             }
         }
+
+        let num_players = game.players.len();
 
         let mut inspired = im::HashSet::new();
         for pos in game.map.iter().map(|cell| cell.position) {
             let mut c = 0;
-            for &ship_pos in enemies.iter() {
+            for &ship_pos in enemies.keys() {
                 if game.map.calculate_distance(&pos, &ship_pos) <= game.constants.inspiration_radius {
                     c += 1;
                 }
@@ -69,6 +72,7 @@ impl State {
             enemies,
             inspired,
             dropoffs,
+            num_players,
             halite,
             width,
             height,
@@ -89,6 +93,82 @@ impl State {
         let toroidal_dy = dy.min(self.height - dy);
 
         toroidal_dx + toroidal_dy
+    }
+
+    pub fn enemy_value(&self, pos: Position) -> Option<usize> {
+        let mut total = 0;
+        let mut c = 0;
+
+        if self.enemies.contains_key(&pos) {
+            c += 1;
+            total += self.enemies[&pos];
+        }
+
+        for dir in Direction::get_all_cardinals() {
+            let new_pos = self.normalize(pos.directional_offset(dir));
+            if self.enemies.contains_key(&new_pos) {
+                c += 1;
+                total += self.enemies[&new_pos];
+            }
+        }
+
+        if c == 0 {
+            None
+        } else {
+            Some(total / c)
+        }
+    }
+
+    pub fn enemy_presence(&self, pos: Position, dist: usize) -> usize {
+        match dist {
+            0 => if self.enemies.contains_key(&pos) {1} else {0}
+            1 => {
+                let mut c = if self.enemies.contains_key(&pos) {1} else {0};
+                for dir in Direction::get_all_cardinals() {
+                    let new_pos = self.normalize(pos.directional_offset(dir));
+                    if self.enemies.contains_key(&new_pos) {
+                        c += 1;
+                    }
+                }
+                c
+            },
+            _ => {
+                let mut c = 0;
+                for &enemy_pos in self.enemies.keys() {
+                    let dist_to = self.calculate_distance(pos, enemy_pos);
+                    if dist_to <= dist {
+                        c += 1;
+                    }
+                }
+                c
+            }
+        }
+    }
+
+    pub fn friendly_presence(&self, pos: Position, dist: usize) -> usize {
+        match dist {
+            0 => if self.taken.contains_key(&pos) {1} else {1}
+            1 => {
+                let mut c = 0;
+                for dir in Direction::get_all_cardinals() {
+                    let new_pos = self.normalize(pos.directional_offset(dir));
+                    if self.taken.contains_key(&new_pos) {
+                        c += 1;
+                    }
+                }
+                c
+            },
+            _ => {
+                let mut c = 0;
+                for &enemy_pos in self.taken.keys() {
+                    let dist_to = self.calculate_distance(pos, enemy_pos);
+                    if dist_to <= dist {
+                        c += 1;
+                    }
+                }
+                c
+            }
+        }
     }
     
     pub fn nearest_dropoff(&self, pos: Position) -> Position {
@@ -227,7 +307,7 @@ impl State {
         state
     }
 
-    pub fn actions(&self, merged: &MergedAction, allow_mine: bool) -> Vec<MergedAction> {
+    pub fn actions(&self, merged: &MergedAction, allow_mine: bool, inspire: bool) -> Vec<MergedAction> {
         let state = self.apply_merged(merged);
 
         let ship_id = merged.ship_id;
@@ -242,48 +322,64 @@ impl State {
                 for dir in Direction::get_all_cardinals() {
                     let new_pos = state.normalize(position.directional_offset(dir));
                     let inspired = state.inspired.contains(&new_pos);
-                    if !state.enemies.contains(&new_pos) || state.dropoffs.contains(&new_pos) {
-                        if state.taken.contains_key(&new_pos) {
-                            if state.dropoffs.contains(&new_pos) {
-                                let mut action = merged.clone();
-
-                                action.pos = new_pos;
-                                action.halite = 0;
-                                action.inspired = inspired;
-                                action.cost += 2 * state.constants.ship_cost as i32;
-
-                                actions.push(action);
-                            }
-                        } else {
+                    if state.taken.contains_key(&new_pos) {
+                        if state.dropoffs.contains(&new_pos) {
                             let mut action = merged.clone();
 
-                            let hal_after = action.halite - cost;
-                            let new_hal = if state.dropoffs.contains(&new_pos) {
-                                action.returned += hal_after;
-                                0
-                            } else {
-                                hal_after
-                            };
-
                             action.pos = new_pos;
-                            action.halite = new_hal;
+                            action.halite = 0;
                             action.inspired = inspired;
-                            action.cost += cost as i32;
+                            action.cost += 2 * state.constants.ship_cost as i32;
 
                             actions.push(action);
                         }
-                    }                    
+                    } else {
+                        let mut action = merged.clone();
+
+                        let hal_after = action.halite - cost;
+                        let new_hal = if state.dropoffs.contains(&new_pos) {
+                            action.returned += hal_after;
+                            0
+                        } else {
+                            hal_after
+                        };
+
+                        action.pos = new_pos;
+                        action.halite = new_hal;
+                        action.inspired = inspired;
+                        action.cost += cost as i32;
+
+                        if let Some(enemy_value) = state.enemy_value(new_pos) {
+                            if !state.dropoffs.contains(&position) {
+                                action.risk = true;
+
+                                let friends = state.friendly_presence(new_pos, 5) as f32;
+                                let enemies = state.enemy_presence(new_pos, 5) as f32;
+
+                                let my_ratio = friends / (friends + enemies) / state.num_players as f32 * 2.0;
+                                let their_ratio = enemies / (friends + enemies) * (state.num_players as f32 - 1.0) / state.num_players as f32 * 2.0;
+
+                                let my_cost = (new_hal + state.constants.ship_cost) as f32 * my_ratio;
+                                let their_cost = (enemy_value + state.constants.ship_cost) as f32 * their_ratio;
+
+                                let diff = (my_cost - their_cost) as i32;
+                                action.cost += diff;
+                            }
+                        }
+
+                        actions.push(action);
+                    }
                 }
             } 
 
-            if allow_mine && state.taken[&position] == ship_id && (!state.enemies.contains(&position) || state.dropoffs.contains(&position)) {
+            if allow_mine && state.taken[&position] == ship_id {
                 let mut action = merged.clone();
 
                 let hal = state.halite(position);
                 let cap = state.constants.max_halite - halite;
 
                 let mined = div_ceil(hal, state.constants.extract_ratio);
-                let mined = if state.inspired.contains(&position) {
+                let mined = if inspire && state.inspired.contains(&position) {
                     action.inspired = true;
                     mined + (mined as f64 * state.constants.inspired_bonus_multiplier) as usize
                 } else {
@@ -303,6 +399,25 @@ impl State {
                 }
 
                 action.cost -= mined as i32;
+
+                if let Some(enemy_value) = state.enemy_value(position) {
+                    if !state.dropoffs.contains(&position) {
+                        action.risk = true;
+
+                        let friends = state.friendly_presence(position, 5) as f32;
+                        let enemies = state.enemy_presence(position, 5) as f32;
+
+                        let my_ratio = friends / (friends + enemies) / state.num_players as f32 * 2.0;
+                        let their_ratio = enemies / (friends + enemies) * (state.num_players as f32 - 1.0) / state.num_players as f32 * 2.0;
+
+                        let my_cost = (action.halite + state.constants.ship_cost) as f32 * my_ratio;
+                        let their_cost = (enemy_value + state.constants.ship_cost) as f32 * their_ratio;
+
+                        let diff = (my_cost - their_cost) as i32;
+                        action.cost += diff;
+                    }
+                }
+
                 actions.push(action);
             }
         }
@@ -324,20 +439,23 @@ impl State {
         let mut state = self.clone();
         state.turn += 1;
 
-        match state.turn - state.start {
-            1 => {
-                for &enemy in &self.enemies {
-                    Log::color(enemy, "#770000");
-                    for dir in Direction::get_all_cardinals() {
-                        let new_pos = self.normalize(enemy.directional_offset(dir));
-                        Log::color(new_pos, "#330000");
-                        state.enemies.insert(new_pos);
-                    }
-                }
-            },
-            // _ => state.enemies.clear()
-            _ => {}
-        };
+        // match state.turn - state.start {
+        //     1 => {
+        //         for &enemy in &self.enemies {
+        //             Log::color(enemy, "#770000");
+        //             for dir in Direction::get_all_cardinals() {
+        //                 let new_pos = self.normalize(enemy.directional_offset(dir));
+        //                 Log::color(new_pos, "#330000");
+        //                 state.enemies.insert(new_pos);
+        //             }
+        //         }
+        //     },
+        //     // _ => {
+        //     //     state.enemies.clear();
+        //     //     state.inspired.clear();
+        //     // }
+        //     _ => {}
+        // };
 
         state
     }
@@ -351,10 +469,10 @@ impl State {
         }
 
         match action.dir {
-            Direction::Still => !self.enemies.contains(&pos) || self.dropoffs.contains(&pos),
+            Direction::Still => self.enemy_presence(pos, 1) == 0 || action.risk || self.dropoffs.contains(&pos),
             _ => {
                 let cost = self.map[&pos] / self.constants.move_cost_ratio;
-                hal >= cost && !self.enemies.contains(&new_pos)
+                hal >= cost && (self.enemy_presence(new_pos, 1) == 0 || action.risk || self.dropoffs.contains(&new_pos))
             }
         }
     }

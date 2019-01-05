@@ -24,6 +24,7 @@ fn main() {
     // Persistent state
     let mut paths = HashMap::new();
     let mut stats = Stats::new();
+    let mut ships_last = HashMap::new();
 
     Game::ready("downside");
 
@@ -31,13 +32,15 @@ fn main() {
         stats.start();
         game.update_frame();
 
-        let mut timeline = Timeline::from(&game, &mut paths);
+        ships_last.retain(|ship_id, _| !game.ships.contains_key(ship_id));
+        let crashed = ships_last.drain().map(|(_, pos)| pos).collect();
+
+        let mut timeline = Timeline::from(&game, crashed, &mut paths);
         let mut command_queue = Vec::new();
 
-        let me = game.players.iter().find(|p| p.id == game.my_id).unwrap();
-        let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
-        let turn_limit = game.constants.max_turns * 2 / 3;
-        let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
+        for (&ship_id, ship) in &game.ships {
+            ships_last.insert(ship_id, ship.position);
+        }
 
         for action in timeline.unpathed_actions() {
             timeline.path_ship(action, &mut paths)
@@ -48,10 +51,12 @@ fn main() {
             command_queue.push(Command::move_ship(ship_id, dir));
         }
 
-        let can_afford_ship = me.halite >= game.constants.ship_cost;
-        let is_safe = !timeline.state(1).taken.contains_key(&me.shipyard.position);
-        if early_game && can_afford_ship && is_safe {
-            command_queue.push(me.shipyard.spawn());
+        let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
+        let turn_limit = game.constants.max_turns * 2 / 3;
+        let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
+
+        if early_game && timeline.spawn_ship() {
+            command_queue.push(Command::spawn_ship());
         }
 
         stats.end();
