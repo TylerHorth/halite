@@ -39,7 +39,9 @@ fn main() {
         let mut command_queue = Vec::new();
 
         for (&ship_id, ship) in &game.ships {
-            ships_last.insert(ship_id, ship.position);
+            if ship.owner != game.my_id {
+                ships_last.insert(ship_id, ship.position);
+            }
         }
 
         for action in timeline.unpathed_actions() {

@@ -119,58 +119,42 @@ impl State {
         }
     }
 
-    pub fn enemy_presence(&self, pos: Position, dist: usize) -> usize {
-        match dist {
-            0 => if self.enemies.contains_key(&pos) {1} else {0}
-            1 => {
-                let mut c = if self.enemies.contains_key(&pos) {1} else {0};
-                for dir in Direction::get_all_cardinals() {
-                    let new_pos = self.normalize(pos.directional_offset(dir));
-                    if self.enemies.contains_key(&new_pos) {
-                        c += 1;
-                    }
-                }
-                c
-            },
-            _ => {
-                let mut c = 0;
-                for &enemy_pos in self.enemies.keys() {
-                    let dist_to = self.calculate_distance(pos, enemy_pos);
-                    if dist_to <= dist {
-                        c += 1;
-                    }
-                }
-                c
+    pub fn friendly_presence(&self, pos: Position, ship_id: ShipId, value: usize) -> Option<usize> {
+        let mut count = 0;
+        let mut cargo = 0;
+        for &(friendly_pos, friendly_id) in self.taken.iter() {
+            let dist_to = self.calculate_distance(pos, friendly_pos);
+            let hal = self.ship(friendly_id).1;
+            if dist_to <= 3 && ship_id != friendly_id {
+                count += 1;
+                cargo += self.constants.max_halite - hal;
             }
+        }
+        if count >= 3 {
+            Some(value.min(cargo))
+        } else {
+            None
         }
     }
 
-    pub fn friendly_presence(&self, pos: Position, dist: usize) -> usize {
-        match dist {
-            0 => if self.taken.contains_key(&pos) {1} else {1}
-            1 => {
-                let mut c = 0;
-                for dir in Direction::get_all_cardinals() {
-                    let new_pos = self.normalize(pos.directional_offset(dir));
-                    if self.taken.contains_key(&new_pos) {
-                        c += 1;
-                    }
-                }
-                c
-            },
-            _ => {
-                let mut c = 0;
-                for &enemy_pos in self.taken.keys() {
-                    let dist_to = self.calculate_distance(pos, enemy_pos);
-                    if dist_to <= dist {
-                        c += 1;
-                    }
-                }
-                c
-            }
+    pub fn friendly_distance(&self, pos: Position) -> f32 {
+        let mut dist = 0f32;
+        for &friendly_pos in self.taken.keys() {
+            let dist_to = self.calculate_distance(pos, friendly_pos);
+            dist += 1.0 / (dist_to as f32 + 1.0)
         }
+        dist
     }
     
+    pub fn enemy_distance(&self, pos: Position) -> f32 {
+        let mut dist = 0f32;
+        for &enemy_pos in self.enemies.keys() {
+            let dist_to = self.calculate_distance(pos, enemy_pos);
+            dist += 1.0 / (dist_to as f32 + 1.0);
+        }
+        dist
+    }
+
     pub fn nearest_dropoff(&self, pos: Position) -> Position {
         self.dropoffs.iter().cloned().min_by_key(|&d| self.calculate_distance(pos, d)).unwrap().clone()
     }
@@ -307,6 +291,34 @@ impl State {
         state
     }
 
+    pub fn risk_value(&self, pos: Position, ship_id: ShipId, halite: usize) -> Option<i32> {
+        Some(0)
+        // self.enemy_value(pos)
+        //     .filter(|_| !self.dropoffs.contains(&pos))
+        //     .map(|enemy_value| {
+        //         if let Some(enemy_value) = self.friendly_presence(pos, ship_id, enemy_value) {
+        //             let sc = self.constants.ship_cost as f32;
+        //             let er = self.constants.extract_ratio as f32;
+        //             let f = self.friendly_distance(pos) as f32;
+        //             let e = self.enemy_distance(pos) as f32;
+        //             let t = e + f;
+        //             let n = self.num_players as f32;
+        //             let eh = enemy_value as f32;
+        //             let mh = halite as f32;
+        //             let th = eh + mh;
+        //             let mv = th * f / t - sc - mh;
+        //             let ev = th * e / t - sc - eh;
+        //             let v = mv / n - ev * (n - 1.0) / n;
+        //             let av = v / 5.0 / er;
+        //             let ac = -av;
+        //
+        //             ac as i32
+        //         } else {
+        //             self.constants.ship_cost as i32
+        //         }
+        //     })
+    }
+
     pub fn actions(&self, merged: &MergedAction, allow_mine: bool, inspire: bool) -> Vec<MergedAction> {
         let state = self.apply_merged(merged);
 
@@ -327,6 +339,7 @@ impl State {
                             let mut action = merged.clone();
 
                             action.pos = new_pos;
+                            // action.returned += action.halite - cost;
                             action.halite = 0;
                             action.inspired = inspired;
                             action.cost += 2 * state.constants.ship_cost as i32;
@@ -349,22 +362,13 @@ impl State {
                         action.inspired = inspired;
                         action.cost += cost as i32;
 
-                        if let Some(enemy_value) = state.enemy_value(new_pos) {
-                            if !state.dropoffs.contains(&position) {
-                                action.risk = true;
-
-                                let friends = state.friendly_presence(new_pos, 5) as f32;
-                                let enemies = state.enemy_presence(new_pos, 5) as f32;
-
-                                let my_ratio = friends / (friends + enemies) / state.num_players as f32 * 2.0;
-                                let their_ratio = enemies / (friends + enemies) * (state.num_players as f32 - 1.0) / state.num_players as f32 * 2.0;
-
-                                let my_cost = (new_hal + state.constants.ship_cost) as f32 * my_ratio;
-                                let their_cost = (enemy_value + state.constants.ship_cost) as f32 * their_ratio;
-
-                                let diff = (my_cost - their_cost) as i32;
-                                action.cost += diff;
-                            }
+                        // if let Some(risk_value) = state.risk_value(new_pos, ship_id, new_hal) {
+                        //     action.risk = true;
+                        //     action.cost += risk_value;
+                        // }
+                        if self.enemy_value(new_pos).is_some() {
+                            action.risk = true;
+                            action.cost += 1000;
                         }
 
                         actions.push(action);
@@ -400,22 +404,13 @@ impl State {
 
                 action.cost -= mined as i32;
 
-                if let Some(enemy_value) = state.enemy_value(position) {
-                    if !state.dropoffs.contains(&position) {
-                        action.risk = true;
-
-                        let friends = state.friendly_presence(position, 5) as f32;
-                        let enemies = state.enemy_presence(position, 5) as f32;
-
-                        let my_ratio = friends / (friends + enemies) / state.num_players as f32 * 2.0;
-                        let their_ratio = enemies / (friends + enemies) * (state.num_players as f32 - 1.0) / state.num_players as f32 * 2.0;
-
-                        let my_cost = (action.halite + state.constants.ship_cost) as f32 * my_ratio;
-                        let their_cost = (enemy_value + state.constants.ship_cost) as f32 * their_ratio;
-
-                        let diff = (my_cost - their_cost) as i32;
-                        action.cost += diff;
-                    }
+                // if let Some(risk_value) = state.risk_value(position, ship_id, action.halite) {
+                //     action.risk = true;
+                //     action.cost += risk_value;
+                // }
+                if self.enemy_value(position).is_some() {
+                    action.risk = true;
+                    action.cost += 1000;
                 }
 
                 actions.push(action);
@@ -468,11 +463,15 @@ impl State {
             return false;
         }
 
+        if self.enemy_value(new_pos).is_some() != action.risk {
+            return false;
+        }
+
         match action.dir {
-            Direction::Still => self.enemy_presence(pos, 1) == 0 || action.risk || self.dropoffs.contains(&pos),
+            Direction::Still => true,
             _ => {
                 let cost = self.map[&pos] / self.constants.move_cost_ratio;
-                hal >= cost && (self.enemy_presence(new_pos, 1) == 0 || action.risk || self.dropoffs.contains(&new_pos))
+                hal >= cost
             }
         }
     }

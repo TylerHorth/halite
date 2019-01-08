@@ -211,11 +211,14 @@ impl Timeline {
 
                     heuristic(hal, dist)
                 },
-                |&(pos, t, hal)| {
+                |&(pos, t, _)| {
                     let state = self.state(t);
                     let turns_remaining = state.turns_remaining();
                     let at_dropoff = state.dropoffs.contains(&pos);
-                    let full_halite = target + hal < TARGET_DELTA;
+                    let merged = merged.borrow();
+                    let action = &merged[&(pos, t)];
+                    let hal = action.halite + action.returned;
+                    let full_halite = hal as i32 + TARGET_DELTA >= target;
                     let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
 
                     let depth_limit = t + dist >= max_lookahead;
@@ -251,7 +254,7 @@ impl Timeline {
     ) {
         let ship_id = initial_action.ship_id;
         let ship = &self.unpathed.remove(&ship_id).expect(&format!("Ship already pathed {}", ship_id.0));
-        let target = (self.constants.max_halite - ship.halite) as i32;
+        let target = self.constants.max_halite as i32;
         let heuristic = |hal, dist| Cost(dist, target + hal);
         let success = |depth_limit, time_limit, full_halite, at_dropoff| {
             depth_limit || ((time_limit || full_halite) && at_dropoff)
