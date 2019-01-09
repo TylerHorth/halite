@@ -360,15 +360,19 @@ impl State {
                         action.pos = new_pos;
                         action.halite = new_hal;
                         action.inspired = inspired;
-                        action.cost += cost as i32;
+                        action.cost += cost as i32 * 5 / 2;
 
-                        // if let Some(risk_value) = state.risk_value(new_pos, ship_id, new_hal) {
-                        //     action.risk = true;
-                        //     action.cost += risk_value;
-                        // }
                         if self.enemy_value(new_pos).is_some() {
                             action.risk = true;
-                            action.cost += 1000;
+                            action.cost += if state.enemies.contains_key(&new_pos) {
+                                1000
+                            } else {
+                                if state.num_players == 2 {
+                                    action.halite as i32 / 5
+                                } else {
+                                    1000
+                                }
+                            }
                         }
 
                         actions.push(action);
@@ -404,15 +408,6 @@ impl State {
 
                 action.cost -= mined as i32;
 
-                // if let Some(risk_value) = state.risk_value(position, ship_id, action.halite) {
-                //     action.risk = true;
-                //     action.cost += risk_value;
-                // }
-                if self.enemy_value(position).is_some() {
-                    action.risk = true;
-                    action.cost += 1000;
-                }
-
                 actions.push(action);
             }
         }
@@ -433,24 +428,6 @@ impl State {
     pub fn next(&self) -> State {
         let mut state = self.clone();
         state.turn += 1;
-
-        // match state.turn - state.start {
-        //     1 => {
-        //         for &enemy in &self.enemies {
-        //             Log::color(enemy, "#770000");
-        //             for dir in Direction::get_all_cardinals() {
-        //                 let new_pos = self.normalize(enemy.directional_offset(dir));
-        //                 Log::color(new_pos, "#330000");
-        //                 state.enemies.insert(new_pos);
-        //             }
-        //         }
-        //     },
-        //     // _ => {
-        //     //     state.enemies.clear();
-        //     //     state.inspired.clear();
-        //     // }
-        //     _ => {}
-        // };
 
         state
     }
