@@ -9,6 +9,7 @@ pub struct State {
     pub enemies: im::HashMap<Position, usize>,
     pub inspired: im::HashSet<Position>,
     pub dropoffs: im::HashSet<Position>,
+    pub enemy_dropoffs: im::HashSet<Position>,
     pub num_players: usize,
     pub halite: usize,
     pub width: usize,
@@ -58,6 +59,16 @@ impl State {
             .chain(me.dropoff_ids.iter().map(|id| game.dropoffs[id].position))
             .collect();
 
+        let mut enemy_dropoffs = im::HashSet::new();
+        for player in &game.players {
+            if player.id != me.id {
+                enemy_dropoffs.insert(player.shipyard.position);
+                for dropoff_id in &player.dropoff_ids {
+                    enemy_dropoffs.insert(game.dropoffs[dropoff_id].position);
+                }
+            }
+        }
+
         let width = game.map.width;
         let height = game.map.height;
         let turn = game.turn_number;
@@ -72,6 +83,7 @@ impl State {
             enemies,
             inspired,
             dropoffs,
+            enemy_dropoffs,
             num_players,
             halite,
             width,
@@ -360,7 +372,7 @@ impl State {
                         action.pos = new_pos;
                         action.halite = new_hal;
                         action.inspired = inspired;
-                        action.cost += cost as i32 * 5 / 2;
+                        action.cost += cost as i32;
 
                         if self.enemy_value(new_pos).is_some() {
                             action.risk = true;
@@ -387,16 +399,17 @@ impl State {
                 let cap = state.constants.max_halite - halite;
 
                 let mined = div_ceil(hal, state.constants.extract_ratio);
+
+                let hal_after = hal - mined;
+
                 let mined = if inspire && state.inspired.contains(&position) {
                     action.inspired = true;
-                    mined + (mined as f64 * state.constants.inspired_bonus_multiplier) as usize
+                    3 * mined
                 } else {
                     action.inspired = false;
                     mined
                 };
                 let mined = mined.min(cap);
-
-                let hal_after = hal - mined;
 
                 action.halite += mined;
 
@@ -444,6 +457,10 @@ impl State {
             return false;
         }
 
+        if action.dropoff {
+            return self.halite + hal + self.halite(pos) >= self.constants.dropoff_cost && !self.enemy_dropoffs.contains(&pos) && !self.dropoffs.contains(&pos)
+        }
+
         match action.dir {
             Direction::Still => true,
             _ => {
@@ -470,6 +487,7 @@ impl Clone for State {
             enemies: self.enemies.clone(),
             inspired: self.inspired.clone(),
             dropoffs: self.dropoffs.clone(),
+            enemy_dropoffs: self.enemy_dropoffs.clone(),
             ..*self
         }
     }

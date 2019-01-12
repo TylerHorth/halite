@@ -48,14 +48,22 @@ fn main() {
             timeline.path_ship(action, &mut paths)
         }
 
-        for (&ship_id, path) in paths.iter_mut() {
-            let dir = path.pop_front().expect("Empty path").dir;
-            command_queue.push(Command::move_ship(ship_id, dir));
-        }
-
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
         let turn_limit = game.constants.max_turns * 2 / 3;
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
+
+        if early_game {
+            timeline.make_dropoff(&mut paths);
+        }
+
+        for (&ship_id, path) in paths.iter_mut() {
+            let action = path.pop_front().expect("Empty path");
+            if action.dropoff {
+                command_queue.push(Command::transform_ship_into_dropoff_site(ship_id))
+            } else {
+                command_queue.push(Command::move_ship(ship_id, action.dir));
+            }
+        }
 
         if early_game && timeline.spawn_ship() {
             command_queue.push(Command::spawn_ship());

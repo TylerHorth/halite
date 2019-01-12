@@ -7,11 +7,12 @@ pub struct Action {
     pub dir: Direction,
     pub inspired: bool,
     pub risk: bool,
+    pub dropoff: bool,
 }
 
 impl Action {
-    pub fn new(ship_id: ShipId, dir: Direction, inspired: bool, risk: bool) -> Action {
-        Action { ship_id, dir, inspired, risk }
+    pub fn new(ship_id: ShipId, dir: Direction, inspired: bool, risk: bool, dropoff: bool) -> Action {
+        Action { ship_id, dir, inspired, risk, dropoff}
     }
 }
 
