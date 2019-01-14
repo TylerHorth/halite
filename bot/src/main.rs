@@ -49,7 +49,7 @@ fn main() {
         }
 
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
-        let turn_limit = game.constants.max_turns * 2 / 3;
+        let turn_limit = game.constants.max_turns * 3 / 4;
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
 
         if early_game {

@@ -263,6 +263,16 @@ impl State {
         self.update_ship(ship_id, new_pos, new_hal);
     }
 
+    pub fn make_dropoff(&mut self, ship_id: ShipId) {
+        let (pos, hal) = self.ships.remove(&ship_id).expect("Cannot convert ship to dropoff");
+        let hal_at_pos = self.halite(pos);
+        let cost = self.constants.dropoff_cost - hal - hal_at_pos;
+
+        self.halite -= cost;
+        self.dropoffs.insert(pos);
+        self.taken.remove(&pos);
+    }
+
     pub fn mine_ship(&mut self, ship_id: ShipId) {
         let ship = self.ship(ship_id);
         let pos = ship.0;
@@ -434,8 +444,9 @@ impl State {
     }
 
     pub fn rm_ship(&mut self, ship_id: ShipId) {
-        let (position, _) = self.ships.remove(&ship_id).expect("Cannot remove ship");
-        self.taken.remove(&position);
+        if let Some((position, _)) = self.ships.remove(&ship_id) {
+            self.taken.remove(&position);
+        }
     }
 
     pub fn next(&self) -> State {
@@ -449,7 +460,7 @@ impl State {
         let (pos, hal) = self.ship(action.ship_id);
         let new_pos = self.normalize(pos.directional_offset(action.dir));
 
-        if action.inspired != self.inspired.contains(&new_pos) {
+        if action.dir == Direction::Still && action.inspired && !self.inspired.contains(&new_pos) {
             return false;
         }
 
@@ -471,9 +482,13 @@ impl State {
     }
 
     pub fn apply(&mut self, action: Action) {
-        match action.dir {
-            Direction::Still => self.mine_ship(action.ship_id),
-            dir => self.move_ship(action.ship_id, dir),
+        if action.dropoff {
+            self.make_dropoff(action.ship_id);
+        } else {
+            match action.dir {
+                Direction::Still => self.mine_ship(action.ship_id),
+                dir => self.move_ship(action.ship_id, dir),
+            }
         }
     }
 }

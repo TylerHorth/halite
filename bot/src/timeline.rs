@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use action::{Action, MergedAction};
 use pathfinding::directed::astar::astar;
+use pathfinding::kuhn_munkres::kuhn_munkres;
+use pathfinding::matrix::Matrix;
 use cost::Cost;
 
 const MAX_LOOKAHEAD: usize = 30;
@@ -13,12 +15,16 @@ const MIN_LOOKAHEAD: usize = 8;
 const MIN_DROPOFF_DIST: usize = 16;
 const MAX_DROPOFF_DIST: usize = 18;
 const KERNEL_SIZE: i32 = 16;
-const TARGET_DELTA: i32 = 50;
+const TARGET_DELTA: i32 = 70;
+const SHIP_DIST_RATIO: usize = 4;
+const SHIP_DROPOFF_RATIO: usize = 10;
+const PATH_TIMEOUT: usize = 8;
 
 pub struct Timeline {
     timeline: RefCell<Vec<State>>,
     unpathed: HashMap<ShipId, Ship>,
     mined: HashMap<Position, usize>,
+    target_dropoffs: HashMap<ShipId, (Position, usize)>,
     spawn_action: MergedAction,
     constants: Constants,
     prime: HashSet<Position>,
@@ -84,14 +90,12 @@ impl Timeline {
                 state.rm_ship(ship_id);
             }
 
+            let make_dropoff = step.last().map(|action| action.dropoff).unwrap_or(false);
+
             let mut seen = HashSet::new();
             for action in step {
                 if !poisoned.contains_key(&action.ship_id) {
-                    if state.can_apply(action) {
-                        // Apply the action and mark ship seen
-                        state.apply(action);
-                        seen.insert(action.ship_id);
-
+                    if (i < PATH_TIMEOUT || make_dropoff) && state.can_apply(action) {
                         if action.dropoff {
                             let (pos, _) = state.ship(action.ship_id);
                             building.insert(pos);
@@ -100,6 +104,10 @@ impl Timeline {
                             let (pos, _) = state.ship(action.ship_id);
                             mined.insert(pos, i);
                         }
+
+                        // Apply the action and mark ship seen
+                        state.apply(action);
+                        seen.insert(action.ship_id);
                     } else {
                         // Poison the path at timestep i if the current action cannot be applied
                         Log::warn(format!("P(s:{},t:{})", action.ship_id.0, i));
@@ -171,45 +179,92 @@ impl Timeline {
             max = max.max(richness[dropoff]);
         }
 
-        let len = richness.len();
-        let avg: usize = richness.values().map(|r| r / len).sum();
-
         let num_ships = me.ship_ids.len();
         let cur_rate = max * (num_ships + 6);
 
+        // Create list of (dropoff, t) tuples
+        let mut dropoffs = HashMap::new();
+        for (i, state) in timeline.iter().enumerate() {
+            for &dropoff_pos in &state.dropoffs {
+                if !dropoffs.contains_key(&dropoff_pos) {
+                    dropoffs.insert(dropoff_pos, i);
+                }
+            }
+        }
+
+        let dropoffs: Vec<_> = dropoffs.into_iter().collect();
+        let ship_ids: Vec<_> = me.ship_ids.iter().cloned().collect();
+
         let mut prime = HashSet::new();
-        for (&pos, &hal) in richness.iter() {
-            let rate = hal * num_ships / 2 + max * num_ships / 2;
-            if rate > cur_rate {
-                let min_dist = game.dropoffs.values()
-                    .map(|d| d.position)
-                    .chain(game.players.iter().map(|p| p.shipyard.position))
-                    .map(|p| game.map.calculate_distance(&pos, &p))
-                    .min()
-                    .unwrap();
+        if ship_ids.len() / SHIP_DROPOFF_RATIO >= dropoffs.len() {
+            for (&pos, &hal) in richness.iter() {
+                let rate = hal * num_ships / 2 + max * num_ships / 2;
+                if rate > cur_rate {
+                    let min_dist = game.dropoffs.values()
+                        .map(|d| d.position)
+                        .chain(game.players.iter().map(|p| p.shipyard.position))
+                        .map(|p| game.map.calculate_distance(&pos, &p))
+                        .min()
+                        .unwrap();
 
-                let max_dist = game.dropoffs.values()
-                    .filter(|d| d.owner == game.my_id)
-                    .map(|d| d.position)
-                    .chain(std::iter::once(me.shipyard.position))
-                    .map(|p| game.map.calculate_distance(&pos, &p))
-                    .min()
-                    .unwrap();
+                    let max_dist = game.dropoffs.values()
+                        .filter(|d| d.owner == game.my_id)
+                        .map(|d| d.position)
+                        .chain(std::iter::once(me.shipyard.position))
+                        .map(|p| game.map.calculate_distance(&pos, &p))
+                        .min()
+                        .unwrap();
 
-
-                if min_dist >= MIN_DROPOFF_DIST && max_dist <= MAX_DROPOFF_DIST {
-                    Log::log(pos, format!("_r{}_", rate), "fuchsia");
-                    prime.insert(pos);
+                    if min_dist >= MIN_DROPOFF_DIST && max_dist <= MAX_DROPOFF_DIST {
+                        Log::log(pos, format!("_r{}_", rate), "fuchsia");
+                        prime.insert(pos);
+                    }
                 }
             }
         }
 
         let can_spawn = building.is_empty() && prime.is_empty();
 
+        let rows = ship_ids.len();
+        let columns = dropoffs.len() * ship_ids.len();
+
+        let mut matrix_vec = Vec::with_capacity(rows * columns);
+        for &ship_id in &ship_ids {
+            let ship_pos = game.ships[&ship_id].position;
+            
+            for &(pos, t) in &dropoffs {
+                let dist = game.map.calculate_distance(&ship_pos, &pos).max(t);
+                let dropoff_value = richness[&pos];
+
+                for num_ships in 0..ship_ids.len() {
+                    let value = dropoff_value / (dist + num_ships * SHIP_DIST_RATIO + 1);
+                    matrix_vec.push(value as i32);
+                }
+            }
+        }
+
+        let matrix = Matrix::from_vec(rows, columns, matrix_vec);
+        let matching = kuhn_munkres(&matrix).1;
+
+        let mut target_dropoffs = HashMap::new();
+        for (ship_id_index, dropoff_slot_index) in matching.into_iter().enumerate() {
+            let ship_id = ship_ids[ship_id_index];
+            let ship_pos = game.ships[&ship_id].position;
+
+            let dropoff_index = dropoff_slot_index / ship_ids.len();
+            let dropoff_pos_t = dropoffs[dropoff_index];
+
+            Log::msg(dropoff_pos_t.0, format!("_sid{}_", ship_id.0));
+            Log::msg(ship_pos, format!("_d({},{},{})_", dropoff_pos_t.0.x, dropoff_pos_t.0.y, dropoff_pos_t.1));
+
+            target_dropoffs.insert(ship_id, dropoff_pos_t);
+        }
+
         Timeline {
             timeline: RefCell::new(timeline),
             unpathed,
             mined,
+            target_dropoffs,
             spawn_action,
             constants,
             prime,
@@ -235,6 +290,9 @@ impl Timeline {
               H: Fn(i32, usize) -> Cost {
             let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
             let initial_pos = initial_action.pos;
+            let target_pos_t = self.target_dropoffs.get(&initial_action.ship_id)
+                .cloned()
+                .unwrap_or_else(|| (self.state(0).nearest_dropoff(initial_pos), 0));
 
             merged.borrow_mut().insert((initial_pos, start), initial_action);
 
@@ -281,7 +339,7 @@ impl Timeline {
                 },
                 |&(pos, t, hal)| {
                     let state = self.state(t);
-                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+                    let dist = state.calculate_distance(pos, target_pos_t.0).max(target_pos_t.1);
 
                     heuristic(hal, dist)
                 },
@@ -293,9 +351,9 @@ impl Timeline {
                     let action = &merged[&(pos, t)];
                     let hal = action.halite + action.returned;
                     let full_halite = hal as i32 + TARGET_DELTA >= target;
-                    let dist = state.calculate_distance(pos, state.nearest_dropoff(pos));
+                    // let dist = state.calculate_distance(pos, target_pos_t.0).max(target_pos_t.1);
 
-                    let depth_limit = t + dist >= max_lookahead;
+                    let depth_limit = t >= max_lookahead;
                     let time_limit = t >= turns_remaining;
 
                     success(depth_limit, time_limit, full_halite, at_dropoff)
@@ -355,7 +413,6 @@ impl Timeline {
             mined: im_rc::HashMap::new(),
             cost: 0,
         };
-
 
         let start = 0;
         let inspire = true;
