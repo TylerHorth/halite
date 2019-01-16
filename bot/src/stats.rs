@@ -23,6 +23,13 @@ impl Stats {
         self.start = SystemTime::now();
     }
 
+    pub fn remaining(&self) -> Duration {
+        let avail = Duration::from_secs(2);
+        let duration = SystemTime::now().duration_since(self.start).expect("Time goes forwards");
+
+        avail - duration
+    }
+
     pub fn end(&mut self) {
         let duration = SystemTime::now().duration_since(self.start).expect("Time goes forwards");
 

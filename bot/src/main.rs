@@ -54,7 +54,7 @@ fn main() {
             timeline.make_dropoff(&mut paths);
         }
 
-        command_queue.extend(timeline.path_ships(&mut paths));
+        command_queue.extend(timeline.path_ships(&mut paths, &stats));
 
         if early_game && timeline.spawn_ship() {
             command_queue.push(Command::spawn_ship());

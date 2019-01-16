@@ -4,13 +4,15 @@ use state::State;
 use std::collections::HashSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::time::Duration;
 use action::{Action, MergedAction};
 use pathfinding::directed::astar::astar;
 use pathfinding::kuhn_munkres::kuhn_munkres;
 use pathfinding::matrix::Matrix;
 use cost::Cost;
+use stats::Stats;
 
-const MAX_LOOKAHEAD: usize = 30;
+const MAX_LOOKAHEAD: usize = 40;
 const MIN_LOOKAHEAD: usize = 20;
 const MIN_DROPOFF_DIST: usize = 16;
 const MAX_DROPOFF_DIST: usize = 22;
@@ -234,7 +236,7 @@ impl Timeline {
         let mut max_prime: Option<(Position, usize)> = None;
         if ship_ids.len() / SHIP_DROPOFF_RATIO >= dropoffs.len() {
             for (&pos, &hal) in richness.iter() {
-                let rate = hal * num_ships / 2 + max * num_ships / 2;
+                let rate = hal * num_ships;
                 if rate > cur_rate {
                     let min_dist = game.dropoffs.values()
                         .map(|d| d.position)
@@ -526,12 +528,19 @@ impl Timeline {
         }
     }
 
-    pub fn path_ships(&mut self, paths: &mut HashMap<ShipId, VecDeque<Action>>) -> Vec<Command> {
+    pub fn path_ships(&mut self, paths: &mut HashMap<ShipId, VecDeque<Action>>, stats: &Stats) -> Vec<Command> {
         let mut command_queue = Vec::new();
 
         let unpathed: Vec<_> = self.unpathed.drain(..).collect();
         for (action, start) in unpathed {
-            self.path_ship(action, start, paths);
+            let remaining = stats.remaining();
+            let max_lookahead = if remaining > Duration::from_millis(700) {
+                MAX_LOOKAHEAD
+            } else {
+                break
+            };
+
+            self.path_ship(action, start, max_lookahead, paths);
         }
 
         let ships = self.state(0).ships.clone();
@@ -583,13 +592,14 @@ impl Timeline {
         &mut self,
         initial_action: MergedAction,
         start: usize,
+        max_lookahead: usize,
         paths: &mut HashMap<ShipId, VecDeque<Action>>,
     ) {
         let ship_id = initial_action.ship_id;
         let ship_pos = initial_action.pos;
         let target = self.target_pos_t(ship_id, ship_pos);
 
-        if let Some(path) = self.path(initial_action.clone(), start, target, MAX_LOOKAHEAD) {
+        if let Some(path) = self.path(initial_action.clone(), start, target, max_lookahead) {
             let mut actions = VecDeque::new();
 
             for (i, diff) in path.iter().enumerate() {
