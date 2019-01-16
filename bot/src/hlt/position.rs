@@ -7,6 +7,10 @@ pub struct Position {
 }
 
 impl Position {
+    pub fn new() -> Position {
+        Position { x: 0, y: 0 }
+    }
+
     pub fn directional_offset(&self, d: Direction) -> Position {
         let (dx, dy) = match d {
             Direction::North => (0, -1),

@@ -270,7 +270,9 @@ impl State {
 
         self.halite -= cost;
         self.dropoffs.insert(pos);
-        self.taken.remove(&pos);
+        if self.taken.contains_key(&pos) && self.taken[&pos] == ship_id {
+            self.taken.remove(&pos);
+        }
     }
 
     pub fn mine_ship(&mut self, ship_id: ShipId) {
@@ -278,20 +280,26 @@ impl State {
         let pos = ship.0;
         let hal = self.halite(pos);
         let cap = self.constants.max_halite - ship.1;
-        let mined = div_ceil(hal, self.constants.extract_ratio);
+        let mined = div_ceil(hal, self.constants.extract_ratio).min(cap);
+
+        self.update_hal(pos, hal - mined);
+
         let mined = if self.inspired.contains(&pos) {
-            mined + (mined as f64 * self.constants.inspired_bonus_multiplier) as usize
+            3 * mined
         } else {
             mined
         };
         let mined = mined.min(cap);
 
-        self.update_hal(pos, hal - mined);
         self.update_ship(ship_id, pos, ship.1 + mined);
     }
 
     pub fn turns_remaining(&self) -> usize {
         self.constants.max_turns - self.turn
+    }
+
+    pub fn end_game(&self) -> bool {
+        self.turns_remaining() < 50
     }
 
     pub fn apply_merged_mut(&mut self, merged: &MergedAction) {
@@ -341,7 +349,7 @@ impl State {
         //     })
     }
 
-    pub fn actions(&self, merged: &MergedAction, allow_mine: bool, inspire: bool) -> Vec<MergedAction> {
+    pub fn actions(&self, merged: &MergedAction, already_mined: bool) -> Vec<MergedAction> {
         let state = self.apply_merged(merged);
 
         let ship_id = merged.ship_id;
@@ -357,7 +365,7 @@ impl State {
                     let new_pos = state.normalize(position.directional_offset(dir));
                     let inspired = state.inspired.contains(&new_pos);
                     if state.taken.contains_key(&new_pos) {
-                        if state.dropoffs.contains(&new_pos) {
+                        if state.dropoffs.contains(&new_pos) && self.end_game() {
                             let mut action = merged.clone();
 
                             action.pos = new_pos;
@@ -402,17 +410,17 @@ impl State {
                 }
             } 
 
-            if allow_mine && state.taken[&position] == ship_id {
+            if state.taken[&position] == ship_id {
                 let mut action = merged.clone();
 
                 let hal = state.halite(position);
                 let cap = state.constants.max_halite - halite;
 
-                let mined = div_ceil(hal, state.constants.extract_ratio);
+                let mined = div_ceil(hal, state.constants.extract_ratio).min(cap);
 
                 let hal_after = hal - mined;
 
-                let mined = if inspire && state.inspired.contains(&position) {
+                let mined = if state.inspired.contains(&position) {
                     action.inspired = true;
                     3 * mined
                 } else {
@@ -429,7 +437,9 @@ impl State {
                     action.mined.insert(position, hal_after);
                 }
 
-                action.cost -= mined as i32;
+                if !already_mined {
+                    action.cost -= mined as i32;
+                }
 
                 actions.push(action);
             }

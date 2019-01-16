@@ -2,7 +2,6 @@ use hlt::direction::Direction;
 use hlt::position::Position;
 use hlt::ship::Ship;
 use hlt::ShipId;
-use hlt::game_map::GameMap;
 use hlt::game::Game;
 use hlt::log::Log;
 use std::collections::HashMap;
@@ -53,9 +52,11 @@ impl Navi {
             }
 
             for ship_id in &player.ship_ids {
-                let ship = &game.ships[ship_id];
-                if player.id == game.my_id || !self.dropoffs.contains(&ship.position) {
-                    self.mark_unsafe_ship(&ship);
+                if player.id == game.my_id {
+                    let ship = &game.ships[ship_id];
+                    if player.id == game.my_id || !self.dropoffs.contains(&ship.position) {
+                        self.mark_unsafe_ship(&ship);
+                    }
                 }
             }
         }
@@ -123,19 +124,19 @@ impl Navi {
         possible_moves
     }
 
-    pub fn naive_navigate(&mut self, ship: &Ship, destination: &Position, map: &GameMap) {
-        let ship_position = ship.position;
-
+    pub fn naive_navigate(&mut self, ship_id: ShipId, ship_pos: Position, dest: Position) {
         // get_unsafe_moves normalizes for us
-        let mut directions = self.get_unsafe_moves(&ship_position, destination);
+        let mut directions = self.get_unsafe_moves(&ship_pos, &dest);
 
-        directions.sort_unstable_by_key(|dir| {
-            let new_pos = ship_position.directional_offset(*dir);
-            map.at_position(&new_pos).halite
-        });
+        self.moving.insert(ship_id, (ship_pos, directions));
+    }
 
+    pub fn nav(&mut self, ship_id: ShipId, ship_pos: Position, dir: Direction) {
+        self.moving.insert(ship_id, (ship_pos, vec![dir]));
+    }
 
-        self.moving.insert(ship.id, (ship_position, directions));
+    pub fn move_away(&mut self, ship_id: ShipId, ship_pos: Position) {
+        self.moving.insert(ship_id, (ship_pos, Direction::get_all_cardinals()));
     }
 
     pub fn move_ship(&mut self, ship_id: ShipId, old: Position, new: Position) {

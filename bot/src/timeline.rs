@@ -11,24 +11,32 @@ use pathfinding::matrix::Matrix;
 use cost::Cost;
 
 const MAX_LOOKAHEAD: usize = 30;
-const MIN_LOOKAHEAD: usize = 8;
+const MIN_LOOKAHEAD: usize = 20;
 const MIN_DROPOFF_DIST: usize = 16;
-const MAX_DROPOFF_DIST: usize = 18;
-const KERNEL_SIZE: i32 = 16;
+const MAX_DROPOFF_DIST: usize = 22;
+const KERNEL_SIZE: i32 = 30;
 const TARGET_DELTA: i32 = 70;
 const SHIP_DIST_RATIO: usize = 4;
-const SHIP_DROPOFF_RATIO: usize = 10;
-const PATH_TIMEOUT: usize = 8;
+const SHIP_DROPOFF_RATIO: usize = 15;
+const PATH_TIMEOUT: usize = 16;
+const SCALE_FACTOR: f64 = SHIP_DIST_RATIO as f64 * 20.0;
+
+fn sig(total: usize, f: usize, scale: f64) -> usize {
+    let factor = -1.0 / (1.0 + (4.0 * (1.0 - f as f64 / scale)).exp()) + 1.0;
+    let res = total as f64 * factor;
+    res as usize
+}
 
 pub struct Timeline {
     timeline: RefCell<Vec<State>>,
-    unpathed: HashMap<ShipId, Ship>,
+    unpathed: Vec<(MergedAction, usize)>,
     mined: HashMap<Position, usize>,
     target_dropoffs: HashMap<ShipId, (Position, usize)>,
     spawn_action: MergedAction,
     constants: Constants,
-    prime: HashSet<Position>,
-    can_spawn: bool,
+    nav: Navi,
+    prime: Option<Position>,
+    save: usize,
 }
 
 impl Timeline {
@@ -42,6 +50,9 @@ impl Timeline {
         let ship_ids: HashSet<ShipId> = me.ship_ids.iter().cloned().collect();
         paths.retain(|ship_id, path| ship_ids.contains(ship_id) && !path.is_empty());
 
+        let mut nav = Navi::new(game.map.width, game.map.height);
+        nav.update_frame(game);
+
         // Add each ship to initial state
         let mut state = State::from(&game);
         for ship_id in paths.keys() {
@@ -51,7 +62,7 @@ impl Timeline {
 
         // Transform path into set of actions at each timestep
         let mut actions: Vec<Vec<Action>> = Vec::new();
-        for (&ship_id, path) in paths.iter() {
+        for (&_ship_id, path) in paths.iter() {
             for (i, &action) in path.iter().enumerate() {
                 if i >= actions.len() {
                     actions.push(Vec::new());
@@ -79,6 +90,7 @@ impl Timeline {
         }
 
         let mut building = HashSet::new();
+        let mut save = 0;
 
         // Create timeline states from sequence of actions
         for (i, step) in actions.into_iter().enumerate() {
@@ -90,24 +102,27 @@ impl Timeline {
                 state.rm_ship(ship_id);
             }
 
-            let make_dropoff = step.last().map(|action| action.dropoff).unwrap_or(false);
-
             let mut seen = HashSet::new();
             for action in step {
                 if !poisoned.contains_key(&action.ship_id) {
-                    if (i < PATH_TIMEOUT || make_dropoff) && state.can_apply(action) {
-                        if action.dropoff {
-                            let (pos, _) = state.ship(action.ship_id);
-                            building.insert(pos);
-                        } else if action.dir == Direction::Still {
-                            // Track the latest time a position was mined
-                            let (pos, _) = state.ship(action.ship_id);
-                            mined.insert(pos, i);
-                        }
+                    let make_dropoff = paths[&action.ship_id].back().map(|a| a.dropoff).unwrap_or(false);
+                    let complete = paths[&action.ship_id].len() <= PATH_TIMEOUT + PATH_TIMEOUT / 2;
+
+                    if (i < PATH_TIMEOUT || make_dropoff || complete) && state.can_apply(action) {
+                        let (pos, _) = state.ship(action.ship_id);
+                        let halite_before = state.halite;
 
                         // Apply the action and mark ship seen
                         state.apply(action);
                         seen.insert(action.ship_id);
+
+                        if action.dropoff {
+                            save += halite_before - state.halite;
+                            building.insert(pos);
+                        } else if action.dir == Direction::Still {
+                            // Track the latest time a position was mined
+                            mined.insert(pos, i);
+                        }
                     } else {
                         // Poison the path at timestep i if the current action cannot be applied
                         Log::warn(format!("P(s:{},t:{})", action.ship_id.0, i));
@@ -125,6 +140,11 @@ impl Timeline {
 
             seen_last = seen;
             timeline.push(state);
+        }
+
+        for ship_id in &me.ship_ids {
+            let ship = &game.ships[ship_id];
+            timeline[0].add_ship(ship);
         }
 
         {
@@ -146,11 +166,27 @@ impl Timeline {
             }
         }
 
-        // Ships that are not pathed
-        let unpathed = ship_ids.into_iter()
-            .filter(|ship_id| !paths.contains_key(ship_id))
-            .map(|ship_id| (ship_id, game.ships[&ship_id].clone()))
-            .collect();
+        let mut unpathed = Vec::new();
+        for ship_id in ship_ids {
+            if !paths.contains_key(&ship_id) {
+                let ship = &game.ships[&ship_id];
+                let action = MergedAction::new(ship_id, ship.position, ship.halite);
+                unpathed.push((action, 0));
+            } else {
+                let len = paths[&ship_id].len();
+                if len <= PATH_TIMEOUT / 2 {
+                    if timeline[len].ships.contains_key(&ship_id) {
+                        let (pos, hal) = timeline[len].ship(ship_id);
+                        let action = MergedAction::new(ship_id, pos, hal);
+                        unpathed.push((action, len));
+                    } else {
+                        Log::info(format!("ShipDel:{}", ship_id.0));
+                    }
+                }
+            }
+        }
+
+        unpathed.sort_by_key(|u| u.1);
 
         // Action to test spawning ships [ship_id = INT_MAX]
         let spawn_action = MergedAction::spawn(me.shipyard.position);
@@ -195,7 +231,7 @@ impl Timeline {
         let dropoffs: Vec<_> = dropoffs.into_iter().collect();
         let ship_ids: Vec<_> = me.ship_ids.iter().cloned().collect();
 
-        let mut prime = HashSet::new();
+        let mut max_prime: Option<(Position, usize)> = None;
         if ship_ids.len() / SHIP_DROPOFF_RATIO >= dropoffs.len() {
             for (&pos, &hal) in richness.iter() {
                 let rate = hal * num_ships / 2 + max * num_ships / 2;
@@ -216,14 +252,18 @@ impl Timeline {
                         .unwrap();
 
                     if min_dist >= MIN_DROPOFF_DIST && max_dist <= MAX_DROPOFF_DIST {
+                        max_prime = max_prime.map(|prev| if rate > prev.1 { (pos, rate) } else { prev }).or(Some((pos, rate)));
                         Log::log(pos, format!("_r{}_", rate), "fuchsia");
-                        prime.insert(pos);
                     }
                 }
             }
         }
 
-        let can_spawn = building.is_empty() && prime.is_empty();
+        let prime = max_prime.map(|m| m.0);
+
+        if prime.is_some() {
+            save += constants.dropoff_cost;
+        }
 
         let rows = ship_ids.len();
         let columns = dropoffs.len() * ship_ids.len();
@@ -237,7 +277,7 @@ impl Timeline {
                 let dropoff_value = richness[&pos];
 
                 for num_ships in 0..ship_ids.len() {
-                    let value = dropoff_value / (dist + num_ships * SHIP_DIST_RATIO + 1);
+                    let value = sig(dropoff_value, dist + num_ships * SHIP_DIST_RATIO, SCALE_FACTOR);
                     matrix_vec.push(value as i32);
                 }
             }
@@ -267,8 +307,9 @@ impl Timeline {
             target_dropoffs,
             spawn_action,
             constants,
+            nav,
             prime,
-            can_spawn,
+            save,
         }
     }
 
@@ -285,18 +326,29 @@ impl Timeline {
         RefMut::map(timeline, |timeline| &mut timeline[t])
     }
 
-    fn path<H, S>(&mut self, initial_action: MergedAction, start: usize, target: i32, inspire: bool, max_lookahead: usize, ignore_mine: bool, heuristic: H, success: S) -> Option<Vec<MergedAction>>
-        where S: Fn(bool, bool, bool, bool) -> bool,
-              H: Fn(i32, usize) -> Cost {
-            let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
-            let initial_pos = initial_action.pos;
-            let target_pos_t = self.target_dropoffs.get(&initial_action.ship_id)
-                .cloned()
-                .unwrap_or_else(|| (self.state(0).nearest_dropoff(initial_pos), 0));
+    pub fn target_pos_t(&self, ship_id: ShipId, pos: Position) -> (Position, usize) {
+        let state = self.state(0);
+        let nearest = (state.nearest_dropoff(pos), 0);
+        if state.end_game() {
+            nearest
+        } else {
+            self.target_dropoffs.get(&ship_id).cloned().unwrap_or(nearest)
+        }
+    }
 
-            merged.borrow_mut().insert((initial_pos, start), initial_action);
+    fn path(
+        &mut self,
+        initial_action: MergedAction,
+        start: usize,
+        target: (Position, usize),
+        max_lookahead: usize,
+    ) -> Option<Vec<MergedAction>> {
+        let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
+        let initial_pos = initial_action.pos;
 
-            let path = astar(
+        merged.borrow_mut().insert((initial_pos, start), initial_action);
+
+        let path = astar(
                 &(initial_pos, start, 0),
                 |&key| {
                     let local_key = (key.0, key.1);
@@ -305,8 +357,8 @@ impl Timeline {
                         let state = self.state(key.1 + 1);
 
                         if key.1 < max_lookahead {
-                            let allow_mine = ignore_mine || self.mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true) || state.dropoffs.contains(&key.0);
-                            state.actions(parent, allow_mine, inspire)
+                            let already_mined = self.mined.get(&key.0).map(|&t| key.1 <= t).unwrap_or(false);
+                            state.actions(parent, already_mined)
                         } else {
                             Vec::new()
                         }
@@ -339,153 +391,109 @@ impl Timeline {
                 },
                 |&(pos, t, hal)| {
                     let state = self.state(t);
-                    let dist = state.calculate_distance(pos, target_pos_t.0).max(target_pos_t.1);
+                    let dist = state.calculate_distance(pos, target.0).max(target.1);
 
-                    heuristic(hal, dist)
+                    Cost(dist, state.constants.max_halite as i32 + hal)
                 },
                 |&(pos, t, _)| {
-                    let state = self.state(t);
-                    let turns_remaining = state.turns_remaining();
-                    let at_dropoff = state.dropoffs.contains(&pos);
                     let merged = merged.borrow();
                     let action = &merged[&(pos, t)];
+
+                    let state = self.state(t).apply_merged(action);
+
+                    let turns_remaining = state.turns_remaining();
+                    let at_target = pos == target.0 && t >= target.1;
                     let hal = action.halite + action.returned;
-                    let full_halite = hal as i32 + TARGET_DELTA >= target;
-                    // let dist = state.calculate_distance(pos, target_pos_t.0).max(target_pos_t.1);
+                    let full_halite = hal as i32 + TARGET_DELTA >= state.constants.max_halite as i32;
 
                     let depth_limit = t >= max_lookahead;
                     let time_limit = t >= turns_remaining;
 
-                    success(depth_limit, time_limit, full_halite, at_dropoff)
+                    depth_limit || ((time_limit || full_halite) && at_target)
                 }
             );
 
-            let mut merged = merged.into_inner();
-            path.map(|(path, _)| path.into_iter().map(|(pos, t, _)| merged.remove(&(pos, t)).unwrap()).collect())
-        }
+        let mut merged = merged.into_inner();
+        path.map(|(path, _)| path.into_iter().map(|(pos, t, _)| merged.remove(&(pos, t)).unwrap()).collect())
+    }
 
     pub fn spawn_ship(&mut self) -> bool {
         let spawn_action = self.spawn_action.clone();
         let taken = self.state(1).taken.contains_key(&spawn_action.pos);
-        let ship_cost = self.constants.ship_cost;
-        let can_afford = self.state(0).halite >= ship_cost;
+        let can_afford = self.state(0).halite >= self.constants.ship_cost + self.save;
+        let target = (spawn_action.pos, 0);
 
-        let target = self.constants.max_halite as i32;
-        let heuristic = |hal, dist| Cost(dist, target + hal);
-        let success = |depth_limit, time_limit, full_halite, at_dropoff| {
-            depth_limit || ((time_limit || full_halite) && at_dropoff)
-        };
-
-        can_afford && !taken && self.can_spawn && self.path(spawn_action, 1, target, false, MIN_LOOKAHEAD, false, heuristic, success).is_some()
+        can_afford && !taken && self.path(spawn_action, 1, target, MIN_LOOKAHEAD).is_some()
     }
 
-    pub fn make_dropoff(
-        &mut self,
-        paths: &mut HashMap<ShipId, VecDeque<Action>>,
-    ) {
-        if self.prime.is_empty() {
+    fn earliest_build(&self, pos: Position) -> usize {
+        let max_ship = self.constants.max_halite - TARGET_DELTA as usize;
+        for (i, state) in self.timeline.borrow().iter().enumerate() {
+            if state.halite + state.halite(pos) + max_ship >= self.constants.dropoff_cost {
+                return i;
+            }
+        }
+
+        return MAX_LOOKAHEAD + 1;
+    }
+
+    pub fn make_dropoff(&mut self, paths: &mut HashMap<ShipId, VecDeque<Action>>) {
+        if self.unpathed.len() == 0 {
             return;
         }
 
-        let closest_ship = paths.keys().map(|&ship_id| {
-            let state = &self.state(0);
-            let (pos, _) = state.ship(ship_id);
-            let closest_drop = self.prime.iter().map(|&drop_pos| {
-                let dist = state.calculate_distance(pos, drop_pos);
-                (drop_pos, dist)
-            }).min_by_key(|d| d.1).unwrap();
-
-            (ship_id, closest_drop.0, closest_drop.1)
-        }).min_by_key(|cs| cs.2).unwrap();
-
-        let ship_id = closest_ship.0;
-        let target = closest_ship.1;
-
-        let (pos, halite) = self.state(0).ship(ship_id);
-
-        let initial_action = MergedAction {
-            ship_id,
-            pos,
-            halite,
-            returned: 0,
-            inspired: false,
-            risk: false,
-            mined: im_rc::HashMap::new(),
-            cost: 0,
+        let target = match self.prime {
+            Some(p) => p,
+            _ => return,
         };
+        let t = self.earliest_build(target);
 
-        let start = 0;
-        let inspire = true;
+        let action_index = self.unpathed.iter()
+            .enumerate()
+            .min_by_key(|(_, (action, start))| {
+                let dist = self.state(0).calculate_distance(action.pos, target);
+                let tdist = if start > &t {
+                    start - t
+                } else { 0 };
 
-        let merged: RefCell<HashMap<(Position, usize), MergedAction>> = RefCell::new(HashMap::new());
-        let initial_pos = initial_action.pos;
+                dist + tdist
+            }).map(|ia| ia.0).expect("Could not find ship to build dropoff with");
 
-        merged.borrow_mut().insert((initial_pos, start), initial_action);
+        let (initial_action, start) = self.unpathed.remove(action_index);
+        let ship_id = initial_action.ship_id;
 
-        let path = astar(
-            &(initial_pos, start, 0),
-            |&key| {
-                let local_key = (key.0, key.1);
-                let successors: Vec<MergedAction> = {
-                    let parent = &merged.borrow()[&local_key];
-                    let state = self.state(key.1 + 1);
-
-                    if key.1 < MAX_LOOKAHEAD {
-                        let allow_mine = self.mined.get(&key.0).map(|&t| key.1 > t).unwrap_or(true) || state.dropoffs.contains(&key.0);
-                        state.actions(parent, allow_mine, inspire)
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                let res: Vec<_> = successors.into_iter()
-                    .filter_map(|action| {
-                        let mut merged = merged.borrow_mut();
-                        let parent_cost = merged[&local_key].cost;
-
-                        let key = (action.pos, key.1 + 1, action.cost);
-                        let local_key = (key.0, key.1);
-                        let marginal_cost = action.cost - parent_cost;
-
-                        if merged.contains_key(&local_key) {
-                            let prev = merged.get_mut(&local_key).unwrap();
-                            if action.cost < prev.cost {
-                                *prev = action;
-                                Some((key, Cost(1, marginal_cost)))
-                            } else {
-                                None
-                            }
-                        } else {
-                            merged.insert(local_key, action);
-                            Some((key, Cost(1, marginal_cost)))
-                        }
-                    }).collect();
-
-                res
-            },
-            |&(pos, t, _)| {
-                let state = self.state(t);
-                let dist = state.calculate_distance(pos, target);
-
-                Cost(dist, 0)
-            },
-            |&(pos, t, _)| {
-                let state = self.state(t);
-                let merged = merged.borrow();
-                let action = &merged[&(pos, t)];
-
-                let has_halite = action.halite + state.halite + state.halite(pos) >= state.constants.dropoff_cost;
-                let at_dest = pos == target;
-
-                has_halite && at_dest
+        if let Some(path) = self.path(initial_action, start, (target, 0), MAX_LOOKAHEAD) {
+            if path.is_empty() {
+                return;
             }
-        );
 
-        let mut merged = merged.into_inner();
-        let path: Option<Vec<MergedAction>> = path.map(|(path, _)| path.into_iter().map(|(pos, t, _)| merged.remove(&(pos, t)).unwrap()).collect());
+            let (i, end) = path.iter().enumerate().last().unwrap();
 
-        if let Some(path) = path {
-            paths.remove(&ship_id);
+            if end.pos != target {
+                return;
+            }
+
+            let (total_halite, ship_halite, tile_halite) = {
+                let state = self.state(start + i);
+                (state.halite, end.halite, state.halite(target))
+            };
+
+            let can_afford = start + i >= t && total_halite + ship_halite + tile_halite >= self.constants.dropoff_cost;
+            if !can_afford {
+                return;
+            }
+
+            self.save = self.constants.dropoff_cost - ship_halite - tile_halite;
+
+            for (i, diff) in path.iter().enumerate() {
+                self.state(start + i).apply_merged_mut(diff);
+            }
+
+            {
+                let dropoff_state = &mut self.state(start + i + 1);
+                dropoff_state.apply_merged_mut(end);
+                dropoff_state.make_dropoff(ship_id);
+            }
 
             let mut actions = VecDeque::new();
 
@@ -497,97 +505,119 @@ impl Timeline {
                 let action = Action::new(next.ship_id, dir, next.inspired, next.risk, false);
 
                 actions.push_back(action);
-                Log::log(next.pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, i, next.halite), "yellow");
+                Log::log(next.pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, start + i, next.halite), "yellow");
             }
 
-            if !actions.is_empty() {
-                let mut last = actions[actions.len() - 1].clone();
-                last.dir = Direction::Still;
-                last.dropoff = true;
-                actions.push_back(last);
+            assert!(!actions.is_empty());
 
+            let mut last = actions[actions.len() - 1].clone();
+            last.dir = Direction::Still;
+            last.dropoff = true;
+            actions.push_back(last);
+            Log::info(format!("_md{}_", last.ship_id.0));
+
+            if !paths.contains_key(&ship_id) {
                 paths.insert(ship_id, actions);
-            } 
+            } else {
+                let path = paths.get_mut(&ship_id).unwrap();
+                assert_eq!(path.len(), start);
+                path.extend(actions);
+            }
         }
     }
 
-    pub fn path_ship(
+    pub fn path_ships(&mut self, paths: &mut HashMap<ShipId, VecDeque<Action>>) -> Vec<Command> {
+        let mut command_queue = Vec::new();
+
+        let unpathed: Vec<_> = self.unpathed.drain(..).collect();
+        for (action, start) in unpathed {
+            self.path_ship(action, start, paths);
+        }
+
+        let ships = self.state(0).ships.clone();
+        for &(ship_id, (pos, hal)) in &ships {
+            if !paths.contains_key(&ship_id) {
+                let target = self.target_dropoffs[&ship_id].0;
+                let can_move = hal >= self.state(0).halite(pos) / self.constants.move_cost_ratio;
+                if can_move {
+                    if pos == target {
+                        self.nav.move_away(ship_id, pos);
+                    } else {
+                        self.nav.naive_navigate(ship_id, pos, target);
+                    }
+                }
+            }
+        }
+
+        let mut expected = HashMap::new();
+        for (&ship_id, path) in paths.iter_mut() {
+            let action = path.pop_front().expect("Empty path");
+            let pos = self.state(0).ship(ship_id).0;
+            if action.dropoff {
+                command_queue.push(Command::transform_ship_into_dropoff_site(ship_id))
+            } else {
+                expected.insert(ship_id, Command::move_ship(ship_id, action.dir));
+                self.nav.nav(ship_id, pos, action.dir);
+            }
+        }
+
+        let end_game = self.state(0).end_game();
+        self.nav.terminal = end_game;
+
+        for (ship_id, dir) in self.nav.collect_moves() {
+            let command = Command::move_ship(ship_id, dir);
+            if let Some(expected) = expected.remove(&ship_id) {
+                if expected != command {
+                    Log::warn(format!("Blocked:{}", ship_id.0));
+                    paths.remove(&ship_id);
+                }
+            }
+
+            command_queue.push(command);
+        }
+
+        command_queue
+    }
+
+    fn path_ship(
         &mut self,
         initial_action: MergedAction,
+        start: usize,
         paths: &mut HashMap<ShipId, VecDeque<Action>>,
     ) {
         let ship_id = initial_action.ship_id;
-        let ship = &self.unpathed.remove(&ship_id).expect(&format!("Ship already pathed {}", ship_id.0));
-        let target = self.constants.max_halite as i32;
-        let heuristic = |hal, dist| Cost(dist, target + hal);
-        let success = |depth_limit, time_limit, full_halite, at_dropoff| {
-            depth_limit || ((time_limit || full_halite) && at_dropoff)
-        };
+        let ship_pos = initial_action.pos;
+        let target = self.target_pos_t(ship_id, ship_pos);
 
-        if let Some(path) = self.path(initial_action.clone(), 0, target, true, MAX_LOOKAHEAD, false, heuristic, success)
-            .or_else(|| self.path(initial_action.clone(), 0, target, true, MIN_LOOKAHEAD, true, heuristic, success)) {
-                let mut actions = VecDeque::new();
+        if let Some(path) = self.path(initial_action.clone(), start, target, MAX_LOOKAHEAD) {
+            let mut actions = VecDeque::new();
 
-                for (i, diff) in path.iter().enumerate() {
-                    self.state(i).apply_merged_mut(diff);
-                }
+            for (i, diff) in path.iter().enumerate() {
+                self.state(i + start).apply_merged_mut(diff);
+            }
 
-                for (i, edge) in path.windows(2).enumerate() {
-                    let prev = &edge[0];
-                    let next = &edge[1];
+            for (i, edge) in path.windows(2).enumerate() {
+                let prev = &edge[0];
+                let next = &edge[1];
 
-                    let dir = self.state(0).get_dir(prev.pos, next.pos);
-                    let action = Action::new(next.ship_id, dir, next.inspired, next.risk, false);
+                let dir = self.state(0).get_dir(prev.pos, next.pos);
+                let action = Action::new(next.ship_id, dir, next.inspired, next.risk, false);
 
-                    actions.push_back(action);
-                    Log::log(next.pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, i, next.halite), "yellow");
-                }
+                actions.push_back(action);
+                Log::log(next.pos, format!("-ship[{}:t{}:h{}]-", ship_id.0, i + start, next.halite), "yellow");
+            }
 
-                if !actions.is_empty() {
+            if !actions.is_empty() {
+                if !paths.contains_key(&ship_id) {
                     paths.insert(ship_id, actions);
-                } 
+                } else {
+                    let path = paths.get_mut(&ship_id).unwrap();
+                    assert_eq!(path.len(), start);
+                    path.extend(actions);
+                }
+            } 
         } else {
             Log::error(format!("No path found for ship {}", ship_id.0));
-
-            let next_actions = self.state(1).actions(&initial_action, true, true);
-
-            if !next_actions.is_empty() {
-                let inspired = self.state(1).inspired.contains(&ship.position);
-                let merged_action = if let Some(still_action) = next_actions.iter().find(|a| a.pos == initial_action.pos) {
-                    still_action
-                } else {
-                    next_actions.first().unwrap()
-                };
-
-                let dir = self.state(0).get_dir(initial_action.pos, merged_action.pos);
-                let action = Action::new(ship_id, dir, inspired, false, false);
-                paths.insert(ship_id, VecDeque::from(vec![action]));
-                self.state(1).apply_merged_mut(merged_action);
-            } else {
-                // Consider invalidating the path of the ship moving onto this position recursively
-                let inspired = self.state(1).inspired.contains(&ship.position);
-                let action = Action::new(ship_id, Direction::Still, inspired, false, false);
-                paths.insert(ship_id, VecDeque::from(vec![action]));
-
-                self.state(1).add_ship(ship);
-            }
         }
-    }
-
-    /// Prioritized actions for each unpathed ship
-    pub fn unpathed_actions(&self) -> impl Iterator<Item=MergedAction> {
-        // Initial actions for each not-pathed ship and the amount of possible sequential actions
-        let mut initial_actions: Vec<(MergedAction, usize)> = self.unpathed.values().map(|ship| {
-                let action = MergedAction::new(ship);
-
-                let state = self.state(1);
-                let num_turns = state.actions(&action, true, true).len();
-
-                (action, num_turns)
-            }).collect();
-
-        // Sort actions by number of possible moves, followed by ship id
-        initial_actions.sort_by_key(|(action, num_turns)| (*num_turns, action.ship_id.0));
-        initial_actions.into_iter().map(|(action, _)| action)
     }
 }

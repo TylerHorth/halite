@@ -1,6 +1,7 @@
 use hlt::direction::Direction;
 use hlt::ShipId;
 
+#[derive(Eq, PartialEq)]
 pub struct Command(pub String);
 
 impl Command {

@@ -25,12 +25,14 @@ fn main() {
     let mut paths = HashMap::new();
     let mut stats = Stats::new();
     let mut ships_last = HashMap::new();
+    let mut nav = Navi::new(game.map.width, game.map.height);
 
     Game::ready("downside");
 
     loop {
         stats.start();
         game.update_frame();
+        nav.update_frame(&game);
 
         ships_last.retain(|ship_id, _| !game.ships.contains_key(ship_id));
         let crashed = ships_last.drain().map(|(_, pos)| pos).collect();
@@ -44,10 +46,6 @@ fn main() {
             }
         }
 
-        for action in timeline.unpathed_actions() {
-            timeline.path_ship(action, &mut paths)
-        }
-
         let halite_remaining: usize = game.map.iter().map(|cell| cell.halite).sum();
         let turn_limit = game.constants.max_turns * 3 / 4;
         let early_game = halite_remaining > total_halite / 2 && game.turn_number < turn_limit;
@@ -56,14 +54,7 @@ fn main() {
             timeline.make_dropoff(&mut paths);
         }
 
-        for (&ship_id, path) in paths.iter_mut() {
-            let action = path.pop_front().expect("Empty path");
-            if action.dropoff {
-                command_queue.push(Command::transform_ship_into_dropoff_site(ship_id))
-            } else {
-                command_queue.push(Command::move_ship(ship_id, action.dir));
-            }
-        }
+        command_queue.extend(timeline.path_ships(&mut paths));
 
         if early_game && timeline.spawn_ship() {
             command_queue.push(Command::spawn_ship());

@@ -29,11 +29,11 @@ pub struct MergedAction {
 }
 
 impl MergedAction {
-    pub fn new(ship: &Ship) -> MergedAction {
+    pub fn new(ship_id: ShipId, pos: Position, halite: usize) -> MergedAction {
         MergedAction {
-            ship_id: ship.id,
-            pos: ship.position,
-            halite: ship.halite,
+            ship_id,
+            pos,
+            halite,
             returned: 0,
             inspired: false,
             risk: false,
